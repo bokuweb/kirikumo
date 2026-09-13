@@ -134,6 +134,9 @@ detail.pod:
 detail.workload_logs_empty:
   en: No Pods match this workload.
   ja: このワークロードに一致する Pod はありません。
+detail.node_logs_empty:
+  en: No Pods are scheduled to this Node.
+  ja: この Node に配置された Pod はありません。
 detail.run:
   en: Run
   ja: 実行

@@ -83,8 +83,8 @@ pub struct Detail {
     store: Entity<Store>,
     key: Option<ObjectKey>,
     tab: Tab,
-    /// Which Pod supplies a workload's log. A Pod detail needs no choice.
-    pod: Option<String>,
+    /// Which Pod supplies a workload's or Node's log. A Pod detail needs no choice.
+    pod: Option<(Option<String>, String)>,
     /// Which container's log is showing, when the object has more than one.
     container: Option<String>,
     /// Whether the log is being followed as the container writes.
@@ -253,7 +253,7 @@ impl Detail {
     /// Fetch again whatever the open tab is showing.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.tab == Tab::Logs {
-            self.refresh_workload_pods(cx);
+            self.refresh_log_pods(cx);
             self.reload_log(cx);
             return;
         }
@@ -373,8 +373,7 @@ impl Detail {
                     .update(cx, |store, cx| store.ensure_events(uid, namespace, cx));
             }
             Tab::Logs => {
-                if detail::has_workload_logs(&object) {
-                    let namespace = object.meta.namespace.clone();
+                if let Some(namespace) = self.indirect_log_namespace(&object) {
                     self.store.update(cx, |store, cx| {
                         store.ensure_list(
                             kirikumo_kube::ResourceKey::new("", "Pod"),
@@ -441,39 +440,58 @@ impl Detail {
             .unwrap_or_default()
     }
 
-    /// Pods selected by the workload in this panel, newest first.
-    fn workload_pods(&self, cx: &App) -> Vec<Object> {
-        let Some(workload) = self.object(cx) else {
+    /// Whether this panel resolves a workload or Node to an explicit Pod.
+    fn indirect_log_namespace(&self, object: &Object) -> Option<Option<String>> {
+        if detail::has_workload_logs(object) {
+            return Some(object.meta.namespace.clone());
+        }
+        self.key
+            .as_ref()
+            .is_some_and(|(resource, _, _)| is_node(resource))
+            .then_some(None)
+    }
+
+    /// Pods selected by the workload or Node in this panel, newest first.
+    fn log_pods(&self, cx: &App) -> Vec<Object> {
+        let Some(subject) = self.object(cx) else {
             return Vec::new();
         };
-        if !detail::has_workload_logs(&workload) {
+        let Some(namespace) = self.indirect_log_namespace(&subject) else {
             return Vec::new();
-        }
+        };
         let pod_key = kirikumo_kube::ResourceKey::new("", "Pod");
         let Some(pods) = self
             .store
             .read(cx)
-            .list(&pod_key, workload.meta.namespace.as_deref())
+            .list(&pod_key, namespace.as_deref())
             .and_then(|fetch| fetch.value())
         else {
             return Vec::new();
         };
-        detail::workload_log_pods(&workload, &pods.items)
-            .into_iter()
-            .cloned()
-            .collect()
+        let selected = match self
+            .key
+            .as_ref()
+            .is_some_and(|(resource, _, _)| is_node(resource))
+        {
+            true => detail::node_log_pods(&subject, &pods.items),
+            false => detail::workload_log_pods(&subject, &pods.items),
+        };
+        selected.into_iter().cloned().collect()
     }
 
     /// The Pod whose log is currently selected.
     fn log_pod(&self, cx: &App) -> Option<Object> {
         let object = self.object(cx)?;
-        if !detail::has_workload_logs(&object) {
+        if self.indirect_log_namespace(&object).is_none() {
             return Some(object);
         }
-        let pods = self.workload_pods(cx);
+        let pods = self.log_pods(cx);
         self.pod
             .as_ref()
-            .and_then(|name| pods.iter().find(|pod| &pod.meta.name == name))
+            .and_then(|(namespace, name)| {
+                pods.iter()
+                    .find(|pod| &pod.meta.namespace == namespace && &pod.meta.name == name)
+            })
             .or_else(|| pods.first())
             .cloned()
     }
@@ -491,14 +509,13 @@ impl Detail {
             .unwrap_or_default()
     }
 
-    fn refresh_workload_pods(&mut self, cx: &mut Context<Self>) {
-        let Some(workload) = self.object(cx) else {
+    fn refresh_log_pods(&mut self, cx: &mut Context<Self>) {
+        let Some(subject) = self.object(cx) else {
             return;
         };
-        if !detail::has_workload_logs(&workload) {
+        let Some(namespace) = self.indirect_log_namespace(&subject) else {
             return;
-        }
-        let namespace = workload.meta.namespace.clone();
+        };
         self.store.update(cx, |store, cx| {
             store.load_list(
                 kirikumo_kube::ResourceKey::new("", "Pod"),
@@ -590,9 +607,13 @@ impl Detail {
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let tokens = Tokens::global(cx).clone();
         let has_containers = !self.containers(cx).is_empty();
-        let has_workload_logs = self
-            .object(cx)
-            .is_some_and(|object| detail::has_workload_logs(&object));
+        let has_indirect_logs = self.object(cx).is_some_and(|object| {
+            detail::has_workload_logs(&object)
+                || self
+                    .key
+                    .as_ref()
+                    .is_some_and(|(resource, _, _)| is_node(resource))
+        });
         let mut tabs = vec![Tab::Overview];
         if self
             .key
@@ -609,7 +630,7 @@ impl Detail {
             tabs.push(Tab::Events);
         }
         tabs.push(Tab::Yaml);
-        if has_containers || has_workload_logs {
+        if has_containers || has_indirect_logs {
             tabs.push(Tab::Logs);
         }
         if has_containers {
@@ -2007,15 +2028,19 @@ impl Detail {
     /// The Logs tab: what to read, and then the reading of it.
     fn logs(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Tokens::global(cx).clone();
-        let workload = self
-            .object(cx)
-            .is_some_and(|object| detail::has_workload_logs(&object));
-        let pods = self.workload_pods(cx);
+        let subject = self.object(cx);
+        let indirect = subject
+            .as_ref()
+            .is_some_and(|object| self.indirect_log_namespace(object).is_some());
+        let node = self
+            .key
+            .as_ref()
+            .is_some_and(|(resource, _, _)| is_node(resource));
+        let pods = self.log_pods(cx);
         let current_pod = self
             .log_pod(cx)
-            .filter(|_| workload)
-            .map(|pod| pod.meta.name)
-            .unwrap_or_default();
+            .filter(|_| indirect)
+            .map(|pod| (pod.meta.namespace, pod.meta.name));
         let containers = self.log_containers(cx);
         let current = self
             .container
@@ -2058,7 +2083,7 @@ impl Detail {
         self.scrolled_last_frame = self.following && arrived;
         self.last_lines = lines.len();
 
-        let pod_picker = (workload && !pods.is_empty()).then(|| {
+        let pod_picker = (indirect && !pods.is_empty()).then(|| {
             h_flex()
                 .w_full()
                 .px_3()
@@ -2077,8 +2102,18 @@ impl Detail {
                 )
                 .children(pods.into_iter().enumerate().map(|(index, pod)| {
                     let name = pod.meta.name;
-                    let selected = name == current_pod;
-                    let picked = name.clone();
+                    let namespace = pod.meta.namespace;
+                    let selected =
+                        current_pod
+                            .as_ref()
+                            .is_some_and(|(current_namespace, current_name)| {
+                                current_namespace == &namespace && current_name == &name
+                            });
+                    let picked = (namespace.clone(), name.clone());
+                    let label = match (node, namespace) {
+                        (true, Some(namespace)) => format!("{namespace}/{name}"),
+                        _ => name,
+                    };
                     div()
                         .id(("log-pod", index))
                         .px_2()
@@ -2096,7 +2131,7 @@ impl Detail {
                             this.text_color(tokens.colors().text_muted)
                         })
                         .hover(|this| this.bg(tokens.colors().row_hover()))
-                        .child(name)
+                        .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.pod = Some(picked.clone());
                             this.container = None;
@@ -2188,18 +2223,19 @@ impl Detail {
             .children(pod_picker)
             .child(controls);
 
-        let workload_pods_fetch = self.object(cx).and_then(|object| {
+        let indirect_pods_fetch = subject.and_then(|object| {
+            let namespace = self.indirect_log_namespace(&object)?;
             let pod_key = kirikumo_kube::ResourceKey::new("", "Pod");
             self.store
                 .read(cx)
-                .list(&pod_key, object.meta.namespace.as_deref())
+                .list(&pod_key, namespace.as_deref())
                 .cloned()
         });
-        let workload_pods_loading = workload
-            && workload_pods_fetch
+        let indirect_pods_loading = indirect
+            && indirect_pods_fetch
                 .as_ref()
                 .is_none_or(|fetch| fetch.is_loading());
-        let workload_pods_error = workload_pods_fetch
+        let indirect_pods_error = indirect_pods_fetch
             .as_ref()
             .and_then(|fetch| fetch.error())
             .map(str::to_string);
@@ -2233,13 +2269,17 @@ impl Detail {
             .track_scroll(&self.scroll)
             .size_full()
             .into_any_element()
-        } else if workload_pods_loading {
+        } else if indirect_pods_loading {
             crate::skeleton::detail(cx)
-        } else if let Some(error) = workload_pods_error {
+        } else if let Some(error) = indirect_pods_error {
             self.notice(error, true, cx)
-        } else if workload && self.log_pod(cx).is_none() {
+        } else if indirect && self.log_pod(cx).is_none() {
             self.notice(
-                rust_i18n::t!("detail.workload_logs_empty").to_string(),
+                rust_i18n::t!(match node {
+                    true => "detail.node_logs_empty",
+                    false => "detail.workload_logs_empty",
+                })
+                .to_string(),
                 false,
                 cx,
             )
@@ -2339,6 +2379,11 @@ impl Render for Detail {
 /// Whether this catalogue identity is the Argo CD Application kind.
 fn is_argo_application(resource: &kirikumo_kube::ResourceKey) -> bool {
     resource.group == kirikumo_ui::gitops::ARGO_CD_GROUP && resource.kind == "Application"
+}
+
+/// Whether a resource is the core Node kind.
+fn is_node(resource: &kirikumo_kube::ResourceKey) -> bool {
+    resource.group.is_empty() && resource.kind == "Node"
 }
 
 /// How one span of the shell's screen is drawn.

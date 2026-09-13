@@ -93,13 +93,23 @@ pub fn workload_log_pods<'a>(workload: &Object, pods: &'a [Object]) -> Vec<&'a O
                 .all(|expression| selector_expression_matches(expression, &pod.meta.labels))
         })
         .collect();
-    matched.sort_by(|left, right| {
-        right
-            .meta
-            .created
-            .cmp(&left.meta.created)
-            .then_with(|| left.meta.name.cmp(&right.meta.name))
-    });
+    sort_pods_newest_first(&mut matched);
+    matched
+}
+
+/// Pods scheduled to a Node, across every namespace, newest first.
+///
+/// Kubernetes has no Node logs subresource. A Node log surface therefore has
+/// to name the actual Pod and container whose output it is showing.
+pub fn node_log_pods<'a>(node: &Object, pods: &'a [Object]) -> Vec<&'a Object> {
+    if node.meta.name.is_empty() {
+        return Vec::new();
+    }
+    let mut matched: Vec<&Object> = pods
+        .iter()
+        .filter(|pod| pod.str_at("spec.nodeName") == node.meta.name)
+        .collect();
+    sort_pods_newest_first(&mut matched);
     matched
 }
 
@@ -155,6 +165,16 @@ fn selector_expression_matches(
         "DoesNotExist" => !labels.contains_key(key),
         _ => false,
     }
+}
+
+fn sort_pods_newest_first(pods: &mut Vec<&Object>) {
+    pods.sort_by(|left, right| {
+        right
+            .meta
+            .created
+            .cmp(&left.meta.created)
+            .then_with(|| left.meta.name.cmp(&right.meta.name))
+    });
 }
 
 /// One labelled fact.
@@ -1247,6 +1267,42 @@ mod tests {
                 .map(|pod| pod.meta.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["api-1"]
+        );
+    }
+
+    #[test]
+    fn node_logs_choose_scheduled_pods_across_namespaces_newest_first() {
+        let node = object(json!({"metadata": {"name": "node-1"}}));
+        let pods = vec![
+            object(json!({
+                "metadata": {"name": "api", "namespace": "shop",
+                    "creationTimestamp": "2026-09-07T12:01:00Z"},
+                "spec": {"nodeName": "node-1", "containers": [{"name": "api"}]}
+            })),
+            object(json!({
+                "metadata": {"name": "dns", "namespace": "kube-system",
+                    "creationTimestamp": "2026-09-07T12:02:00Z"},
+                "spec": {"nodeName": "node-1", "containers": [{"name": "dns"}]}
+            })),
+            object(json!({
+                "metadata": {"name": "elsewhere", "namespace": "shop",
+                    "creationTimestamp": "2026-09-07T12:03:00Z"},
+                "spec": {"nodeName": "node-2", "containers": [{"name": "api"}]}
+            })),
+        ];
+
+        assert_eq!(
+            node_log_pods(&node, &pods)
+                .into_iter()
+                .map(|pod| {
+                    format!(
+                        "{}/{}",
+                        pod.meta.namespace.as_deref().unwrap_or_default(),
+                        pod.meta.name
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec!["kube-system/dns", "shop/api"]
         );
     }
 
