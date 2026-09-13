@@ -1,8 +1,9 @@
 //! What can be done to an object, and what each thing becomes on the wire.
 //!
 //! The viewer's few writes (`docs/roadmap.md` M4): sync, delete, scale, restart,
-//! cordon and uncordon, and applying an edited manifest. Each is decided here
-//! — which kinds offer it, which RBAC verb it needs, what patch it is — so
+//! suspend or resume a CronJob, cordon and uncordon, and apply an edited
+//! manifest. Each is decided here — which kinds offer it, which RBAC verb it
+//! needs, what patch it is — so
 //! the rules can be tested without a window or a cluster, and so the view
 //! that draws the buttons holds no opinion about Kubernetes.
 //!
@@ -24,6 +25,10 @@ pub enum Action {
     Scale,
     /// Roll every pod of a controller, the way `kubectl rollout restart` does.
     Restart,
+    /// Stop a CronJob from creating scheduled Jobs.
+    Suspend,
+    /// Let a suspended CronJob create scheduled Jobs again.
+    Resume,
     /// Stop scheduling onto a node.
     Cordon,
     /// Schedule onto it again.
@@ -44,6 +49,8 @@ impl Action {
         Action::Sync,
         Action::Scale,
         Action::Restart,
+        Action::Suspend,
+        Action::Resume,
         Action::Cordon,
         Action::Uncordon,
         Action::Drain,
@@ -61,6 +68,8 @@ impl Action {
             Self::Sync
             | Self::Scale
             | Self::Restart
+            | Self::Suspend
+            | Self::Resume
             | Self::Cordon
             | Self::Uncordon
             | Self::Drain => "patch",
@@ -74,6 +83,8 @@ impl Action {
             Self::Sync => "action.sync",
             Self::Scale => "action.scale",
             Self::Restart => "action.restart",
+            Self::Suspend => "action.suspend",
+            Self::Resume => "action.resume",
             Self::Cordon => "action.cordon",
             Self::Uncordon => "action.uncordon",
             Self::Drain => "action.drain",
@@ -115,6 +126,12 @@ pub fn available(resource: &ApiResource, object: &Object) -> Vec<Action> {
         }
         if restartable {
             actions.push(Action::Restart);
+        }
+        if resource.group == "batch" && kind == "CronJob" {
+            actions.push(match object.bool_at("spec.suspend") {
+                true => Action::Resume,
+                false => Action::Suspend,
+            });
         }
         if kind == "Node" {
             actions.push(match object.bool_at("spec.unschedulable") {
@@ -160,6 +177,11 @@ pub fn restart(now: DateTime<Utc>) -> Patch {
             "kubectl.kubernetes.io/restartedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         }}}}
     }))
+}
+
+/// The patch that suspends a CronJob, or lets its schedule run again.
+pub fn suspended(suspend: bool) -> Patch {
+    Patch::Merge(json!({"spec": {"suspend": suspend}}))
 }
 
 /// Ask Argo CD to sync the whole Application at its configured revision.
@@ -290,6 +312,21 @@ mod tests {
     }
 
     #[test]
+    fn a_cron_job_offers_suspend_or_resume_from_its_current_state() {
+        let mut cron_job = resource("CronJob", FULL);
+        cron_job.group = "batch".into();
+
+        assert_eq!(
+            available(&cron_job, &object(json!({"spec": {"suspend": false}}))),
+            vec![Action::Suspend, Action::Apply, Action::Delete]
+        );
+        assert_eq!(
+            available(&cron_job, &object(json!({"spec": {"suspend": true}}))),
+            vec![Action::Resume, Action::Apply, Action::Delete]
+        );
+    }
+
+    #[test]
     fn only_an_idle_argo_application_offers_sync() {
         let mut application = resource("Application", FULL);
         application.group = "argoproj.io".into();
@@ -360,6 +397,8 @@ mod tests {
         assert_eq!(Action::Sync.verb(), "patch");
         assert_eq!(Action::Scale.verb(), "patch");
         assert_eq!(Action::Restart.verb(), "patch");
+        assert_eq!(Action::Suspend.verb(), "patch");
+        assert_eq!(Action::Resume.verb(), "patch");
         assert_eq!(Action::Cordon.verb(), "patch");
         assert_eq!(Action::Drain.verb(), "patch");
         assert_eq!(Action::Apply.verb(), "update");
@@ -373,6 +412,18 @@ mod tests {
             5
         );
         assert_eq!(current_replicas(&object(json!({"spec": {}}))), 1);
+    }
+
+    #[test]
+    fn suspending_and_resuming_only_change_the_cron_jobs_flag() {
+        assert_eq!(
+            suspended(true),
+            Patch::Merge(json!({"spec": {"suspend": true}}))
+        );
+        assert_eq!(
+            suspended(false),
+            Patch::Merge(json!({"spec": {"suspend": false}}))
+        );
     }
 
     #[test]

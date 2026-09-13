@@ -193,7 +193,7 @@ Before writing a widget, check `gpui-component`'s gallery for an existing one.
 
 ## 5. Milestones
 
-**M0 and M1 have landed; M2 is under way.** What works today:
+**M0–M5 have landed.** What works today:
 
 - The **window** opens frameless over a blurred desktop, with the three columns resizable and their arrangement, the appearance, the context, the kind and the namespace all remembered across launches.
 - The **kubeconfig layer** reads and merges `KUBECONFIG` first-wins, resolves a context into a connection, and authenticates with client certificates, a token, a token file, basic auth or an **exec credential plugin** whose answer is cached until it expires.
@@ -207,7 +207,7 @@ Before writing a widget, check `gpui-component`'s gallery for an existing one.
 - **Argo CD gets a native surface.** When `Application.argoproj.io` is discovered, Application, ApplicationSet and AppProject sit in an optional GitOps group. An Application's Overview reads project, destination, sources, revision, sync policy, operation, sync and health directly from its CR; its row mark combines Argo's operation, health and sync words. A Resources tab draws `status.resources` as a stable namespace/kind/name-sorted virtualized list, with Argo's sync and health per row. A managed-resource row links to the generic object view only when Argo's destination server matches the selected kubeconfig context's server (ignoring a trailing slash) and discovery says that kind is served; Argo's destination name alone is never treated as a kubeconfig identity. An idle Application offers Sync through the normal `Cluster::patch` path, RBAC check and named second confirmation; the operation is full-app, uses the configured revision and does not enable prune. An ApplicationSet's Overview reads its generators, template project and destination, Go-template mode, strategy and generated count; its row mark follows Argo's own health/condition priority. An AppProject's Overview reads source repositories and namespaces, destinations, resource allow/deny lists, role names, orphan monitoring, project-scoped cluster policy and sync-window count, but never JWT material. No Argo session or API client is introduced.
 - **A command runs in a container.** A *Run* tab on a pod: a line through `sh -c`, stdout and stderr back, the exit code, or the apiserver's words when it never ran. Gated by the `pods/exec` review.
 - **A port on a pod is a port on `localhost`.** A chip per declared container port; one click forwards it, the same number locally when it is free and any free port otherwise, and the panel says what is open. One WebSocket per local connection, so a stuck one stalls nothing else, and a refusal from the apiserver resets that connection the way a pod being down would.
-- **It can act, carefully.** Sync an Argo CD Application, scale, restart, cordon and uncordon, drain, delete, and apply an edited manifest — each reached from the object it acts on, each taking two gestures with the second naming the object, each greyed out when `SelfSubjectAccessReview` says this login may not. Nothing destructive is on a key or in the palette (K6).
+- **It can act, carefully.** Sync an Argo CD Application, scale, restart, suspend or resume a CronJob, cordon and uncordon, drain, delete, and apply an edited manifest — each reached from the object it acts on, each taking two gestures with the second naming the object, each greyed out when `SelfSubjectAccessReview` says this login may not. Nothing destructive is on a key or in the palette (K6).
 - **`⌘K` reaches everything by name** — every kind, every namespace, every context, and the four commands that are none of those — ranked by score, and holding nothing that can destroy anything.
 - **Switching context** rebuilds the connection and clears everything the last cluster said. An insecure connection says so in the sidebar.
 - **English and Japanese.** Every user-visible string is in `locales/app.yml` in both.
@@ -223,8 +223,21 @@ Nothing in M0–M5 is outstanding. The mount into Ginka's window is deferred; th
 | **M1** | Everything is a table | API discovery, the resource tree in the sidebar, one virtualized table for every kind with `kubectl`'s columns — and a custom resource's own, from its CRD — the namespace picker, health marks, the detail's Overview, Events, YAML and Logs | **Landed.** |
 | **M2** | Live | Watches wired to the store with bookmarks and re-list, rows updated in place rather than rebuilt, `⌘F`/`⌘L`/`⌘K` | **Landed.** Backoff tuning against a real flaky apiserver rather than a scripted one |
 | **M3** | Pods in depth | Logs following, with find and the previous instance; `metrics.k8s.io` for nodes and pods; owner/child navigation | **Landed.** Wrapping long log lines (needs a variable-height virtualized list); metrics in the *table* as well as the panel, which needs a column set that depends on what the cluster can answer, and rows that go stale on a clock rather than on a version |
-| **M4** | Acting | Delete, scale, restart, cordon/uncordon/drain, apply an edited YAML — each behind a confirmation that names the object, each greyed out when `SelfSubjectAccessReview` says no (K6) | **Landed.** |
+| **M4** | Acting | Delete, scale, restart, CronJob suspend/resume, cordon/uncordon/drain, apply an edited YAML — each behind a confirmation that names the object, each greyed out when `SelfSubjectAccessReview` says no (K6) | **Landed.** |
 | **M5** | Reaching in | Port-forward over WebSocket, one tunnel per local connection, from a chip on the pod; a command run in a container with its output and exit code on a *Run* tab; an interactive shell on a *Shell* tab, drawn by `alacritty_terminal` — **all three landed and verified against a `kind` cluster** (`tests/live.rs`); the mount into Ginka's window, **deferred** — the app stands alone for now (§8, 2026-09-12) | **Landed.** |
+
+### 5.1 Lens parity backlog after v1
+
+This is the explicit boundary between useful parity and copying Lens wholesale. The comparison uses Lens's documented resource views; for example, its [CronJob actions](https://docs.k8slens.dev/k8slens/using-lens/workloads/cron-jobs/) and [configurable ReplicaSet table](https://docs.k8slens.dev/k8slens/using-lens/workloads/replica-sets/).
+
+| Priority | Lens capability not yet in Kirikumo | Direction |
+| --- | --- | --- |
+| **Now** | Suspend or resume a CronJob | **Implemented.** Patch only `spec.suspend`, behind the existing `patch` RBAC review and named second confirmation. |
+| **Next** | Trigger a CronJob immediately | Add a narrow create-Job operation behind `Cluster`; do not grow a generic manifest authoring surface. |
+| **Next** | Resize, reorder and hide table columns | Keep the default equal to `kubectl get`; make reader overrides view state and persist only column preferences, never row data. |
+| **Next** | Rich native details for storage, networking, autoscaling and RBAC resources | Add generic JSON-to-view-model functions kind by kind while retaining YAML and the unknown-kind fallback. |
+| **Later** | Export a table | Do not write cluster payloads to disk under rule 10. A copy-to-clipboard representation is compatible; Lens-style CSV file export is not. |
+| **Out** | Helm/chart management, metrics history/Prometheus, multi-cluster aggregation, node/desktop shell and extension marketplace | Remain explicit §3.2 non-goals. They require a package manager, retained telemetry, aggregation, host terminal or plugin platform rather than a stronger viewer. |
 
 ## 6. Quality bars
 

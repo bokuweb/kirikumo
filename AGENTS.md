@@ -22,7 +22,7 @@ When Argo CD is installed, its Applications, ApplicationSets and AppProjects get
 
 **The table is live.** The list on screen — and only that one — is followed: a thread reads the watch, bookmarks keep the resume point moving, a `410 Gone` re-lists, a dropped connection backs off, and only the rows whose objects actually moved are formatted again. `KIRIKUMO_DEMO=1` has a scripted watch, so the whole path can be exercised without a cluster.
 
-`⌘K` reaches every kind, namespace, context and command by name; the detail panel links up to an object's controller and node and down to what a selector selects, with an explicit Pod logs route from a Deployment, reports what a pod or node is using when the cluster has a metrics server, and **follows a container's log** with a previous-instance toggle and a literal find. **It can act**: sync an Argo CD Application, scale, restart, cordon/uncordon/drain, delete, and apply an edited manifest, each behind a second button that names the object and each greyed out when RBAC says no. **A pod's ports forward to `localhost`** from a chip, one WebSocket per local connection, **a command runs in a container** from a *Run* tab, with its output and exit code, and **a shell attaches to a container** on a *Shell* tab, drawn by `alacritty_terminal` at the version Ginka uses. See `docs/roadmap.md` §5.
+`⌘K` reaches every kind, namespace, context and command by name; the detail panel links up to an object's controller and node and down to what a selector selects, with an explicit Pod logs route from a Deployment, reports what a pod or node is using when the cluster has a metrics server, and **follows a container's log** with a previous-instance toggle and a literal find. **It can act**: sync an Argo CD Application, scale, restart, suspend/resume a CronJob, cordon/uncordon/drain, delete, and apply an edited manifest, each behind a second button that names the object and each greyed out when RBAC says no. **A pod's ports forward to `localhost`** from a chip, one WebSocket per local connection, **a command runs in a container** from a *Run* tab, with its output and exit code, and **a shell attaches to a container** on a *Shell* tab, drawn by `alacritty_terminal` at the version Ginka uses. See `docs/roadmap.md` §5.
 
 ## Commands
 
@@ -35,6 +35,7 @@ KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN=Pod/shop/api-7d9f8c-2xk4t cargo run   # ...op
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Pod/shop/api-7d9f8c-2xk4t#logs' cargo run  # ...on its log, following (#events, #yaml, #run, #shell too)
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Deployment.apps/shop/api#logs' cargo run  # ...on a workload's Pod picker and log
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Node//node-1#logs' cargo run  # ...on a Node's cross-namespace Pod picker and log
+KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='CronJob.batch/observability/backup' cargo run  # ...on an active CronJob with Suspend
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Application.argoproj.io/argocd/shop#resources' cargo run  # ...on the Argo CD Resources tab
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='ApplicationSet.argoproj.io/argocd/environments' cargo run  # ...on an ApplicationSet
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='AppProject.argoproj.io/argocd/production' cargo run  # ...on an AppProject

@@ -105,7 +105,7 @@ impl Scripted {
             resource("", "v1", "Pod", "pods", true),
             resource("apps", "v1", "Deployment", "deployments", true),
             resource("apps", "v1", "ReplicaSet", "replicasets", true),
-            resource("batch", "v1", "CronJob", "cronjobs", true),
+            patchable(resource("batch", "v1", "CronJob", "cronjobs", true)),
             resource("", "v1", "ConfigMap", "configmaps", true),
             resource("", "v1", "Service", "services", true),
             resource(
@@ -1445,6 +1445,40 @@ mod tests {
             .unwrap();
         assert_eq!(synced.at("operation.sync"), Some(&json!({})));
         assert_eq!(synced.str_at("operation.initiatedBy.username"), "kirikumo");
+    }
+
+    #[test]
+    fn a_sample_cron_job_suspends_and_resumes_through_the_real_patch_path() {
+        let cluster = Scripted::sample();
+        let cron_jobs = resource_for(&cluster, "batch", "CronJob");
+
+        let suspended = cluster
+            .patch(
+                &cron_jobs,
+                Some("observability"),
+                "backup",
+                crate::actions::suspended(true),
+            )
+            .unwrap();
+        assert!(suspended.bool_at("spec.suspend"));
+        assert!(
+            crate::actions::available(&cron_jobs, &suspended)
+                .contains(&crate::actions::Action::Resume)
+        );
+
+        let resumed = cluster
+            .patch(
+                &cron_jobs,
+                Some("observability"),
+                "backup",
+                crate::actions::suspended(false),
+            )
+            .unwrap();
+        assert!(!resumed.bool_at("spec.suspend"));
+        assert!(
+            crate::actions::available(&cron_jobs, &resumed)
+                .contains(&crate::actions::Action::Suspend)
+        );
     }
 
     #[test]

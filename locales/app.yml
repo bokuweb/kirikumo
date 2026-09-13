@@ -234,6 +234,12 @@ action.scale:
 action.restart:
   en: Restart
   ja: 再起動
+action.suspend:
+  en: Suspend
+  ja: 一時停止
+action.resume:
+  en: Resume
+  ja: 再開
 action.cordon:
   en: Cordon
   ja: Cordon
@@ -273,6 +279,12 @@ action.confirm.scale:
 action.confirm.restart:
   en: "Restart %{name}"
   ja: "%{name} を再起動"
+action.confirm.suspend:
+  en: "Suspend %{name}"
+  ja: "%{name} を一時停止"
+action.confirm.resume:
+  en: "Resume %{name}"
+  ja: "%{name} を再開"
 action.confirm.cordon:
   en: "Cordon %{name}"
   ja: "%{name} を cordon"

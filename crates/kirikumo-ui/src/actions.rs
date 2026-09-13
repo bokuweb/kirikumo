@@ -101,6 +101,8 @@ pub fn confirm_label(action: Action, name: &str, replicas: Option<u32>) -> Strin
         )
         .to_string(),
         Action::Restart => rust_i18n::t!("action.confirm.restart", name = name).to_string(),
+        Action::Suspend => rust_i18n::t!("action.confirm.suspend", name = name).to_string(),
+        Action::Resume => rust_i18n::t!("action.confirm.resume", name = name).to_string(),
         Action::Cordon => rust_i18n::t!("action.confirm.cordon", name = name).to_string(),
         Action::Uncordon => rust_i18n::t!("action.confirm.uncordon", name = name).to_string(),
         Action::Drain => rust_i18n::t!("action.confirm.drain", name = name).to_string(),
@@ -167,6 +169,8 @@ mod tests {
             Action::Sync,
             Action::Delete,
             Action::Restart,
+            Action::Suspend,
+            Action::Resume,
             Action::Cordon,
             Action::Drain,
             Action::Apply,
