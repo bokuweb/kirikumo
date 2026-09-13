@@ -591,6 +591,39 @@ impl Row {
     }
 }
 
+/// Render the current table shape as tab-separated text for the clipboard.
+///
+/// The caller supplies rows in display order, which makes the export follow
+/// the active sort and filter without teaching this pure layer either UI
+/// concept. Columns already reflect visibility and reader-chosen order.
+/// Fields containing a tab, line break or quote use CSV-style quoting so a
+/// spreadsheet paste keeps the same grid.
+pub fn clipboard_tsv<'a>(columns: &ColumnSet, rows: impl IntoIterator<Item = &'a Row>) -> String {
+    let mut lines = Vec::new();
+    lines.push(
+        columns
+            .columns()
+            .map(|column| quote_tsv(&column.title))
+            .collect::<Vec<_>>()
+            .join("\t"),
+    );
+    lines.extend(rows.into_iter().map(|row| {
+        row.cells
+            .iter()
+            .map(|cell| quote_tsv(cell))
+            .collect::<Vec<_>>()
+            .join("\t")
+    }));
+    lines.join("\n")
+}
+
+fn quote_tsv(value: &str) -> String {
+    match value.contains(['\t', '\n', '\r', '"']) {
+        true => format!("\"{}\"", value.replace('"', "\"\"")),
+        false => value.to_string(),
+    }
+}
+
 /// Sort rows by a column.
 ///
 /// Ages sort by their timestamp, numbers by their value, and everything else
@@ -1014,6 +1047,45 @@ mod tests {
                 "node-1",
                 "3h"
             ]
+        );
+    }
+
+    #[test]
+    fn clipboard_export_is_the_current_columns_and_rows_in_their_current_order() {
+        let columns = ColumnSet::for_kind("Pod", true, false).with_preferences(&[
+            ColumnPreference::shown("STATUS", None),
+            ColumnPreference::shown("NAME", None),
+            ColumnPreference::hidden("READY"),
+            ColumnPreference::hidden("RESTARTS"),
+            ColumnPreference::hidden("IP"),
+            ColumnPreference::hidden("NODE"),
+            ColumnPreference::hidden("AGE"),
+        ]);
+        let first = columns.row(&pod(), now());
+        let second = columns.row(
+            &object(json!({
+                "metadata": {"name": "worker", "namespace": "shop", "uid": "u2"},
+                "spec": {"containers": [{"name": "worker"}]},
+                "status": {"phase": "Pending"}
+            })),
+            now(),
+        );
+
+        assert_eq!(
+            clipboard_tsv(&columns, [&second, &first]),
+            "STATUS\tNAME\nPending\tworker\nRunning\tapi-7d9f8c-2xk"
+        );
+    }
+
+    #[test]
+    fn clipboard_export_quotes_cells_that_would_change_the_grid() {
+        let columns = ColumnSet::for_kind("Rollout", true, false);
+        let mut row = columns.row(&object(json!({"metadata": {"name": "demo"}})), now());
+        row.cells[0] = "a\tb\n\"quoted\"".into();
+
+        assert_eq!(
+            clipboard_tsv(&columns, [&row]),
+            "NAME\tAGE\n\"a\tb\n\"\"quoted\"\"\"\t<unknown>"
         );
     }
 

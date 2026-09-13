@@ -72,7 +72,7 @@ As Ginka §3.1: each column paints itself to the top and carries a 44 px strip; 
 
 ### 3.3 Centre — the table
 
-The centre strip carries the kind's name and the namespace it is scoped to, then the **namespace picker** (a chip that opens a filterable list, with *All namespaces* at the top and disabled for cluster-scoped kinds), the **filter box** (240 px, fuzzy over every cell in the row, live as it is typed), column settings, refresh, and the right-panel toggle. Column settings opens a table-local panel: a visible mark, up/down controls, narrower/wider steps and *Auto* per heading, plus *Reset*. NAME is fixed visible because it is the row identity; everything else may be hidden. Preferences are per resource and store only headings, order, visibility and optional pixel widths.
+The centre strip carries the kind's name and the namespace it is scoped to, then the **namespace picker** (a chip that opens a filterable list, with *All namespaces* at the top and disabled for cluster-scoped kinds), the **filter box** (240 px, fuzzy over every cell in the row, live as it is typed), copy, column settings, refresh, and the right-panel toggle. Copy puts the visible headings and the currently filtered and sorted rows on the clipboard as spreadsheet-safe TSV, briefly replacing its icon with a check; it never writes a cluster payload to disk. Column settings opens a table-local panel: a visible mark, up/down controls, narrower/wider steps and *Auto* per heading, plus *Reset*. NAME is fixed visible because it is the row identity; everything else may be hidden. Preferences are per resource and store only headings, order, visibility and optional pixel widths.
 
 A `uniform_list` of 28 px rows under a sticky header:
 

@@ -120,6 +120,21 @@ impl ResourceTable {
         (self.visible.len(), self.rows.len())
     }
 
+    /// The visible table as pasteable tab-separated text.
+    ///
+    /// `visible` already carries the active filter in the sorted row order,
+    /// while `columns` already carries visibility and reader-chosen order.
+    pub fn clipboard_tsv(&self) -> Option<String> {
+        (!self.visible.is_empty()).then(|| {
+            table::clipboard_tsv(
+                &self.columns,
+                self.visible
+                    .iter()
+                    .filter_map(|index| self.rows.get(*index)),
+            )
+        })
+    }
+
     /// Open or close the column controls anchored over this table.
     pub fn toggle_columns(&mut self, cx: &mut Context<Self>) {
         self.showing_columns = !self.showing_columns;

@@ -26,6 +26,8 @@ When Argo CD is installed, its Applications, ApplicationSets and AppProjects get
 
 Storage, networking, autoscaling and access-control built-ins have compact native Overview sections over their unstructured JSON: PV/PVC binding, StorageClass policy, Ingress routes and TLS, NetworkPolicy isolation, HPA progress, and RBAC rules and subjects. ServiceAccount summaries show secret reference names only. Unknown kinds retain the generic metadata, conditions and YAML path.
 
+The current table can be copied to the clipboard as TSV. It includes only visible columns and filtered rows in their displayed sort order, quotes grid-breaking characters, and never writes a cluster payload to disk.
+
 ## Commands
 
 ```bash
