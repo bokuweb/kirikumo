@@ -120,6 +120,8 @@ pub struct Shell {
     showing_palette: bool,
     /// The palette was asked for before there was a window to open it in.
     open_palette_pending: bool,
+    /// The column panel was asked for before discovery chose a table.
+    open_columns_pending: bool,
     /// Something to put in the filter box at the next frame, which is the
     /// next place with a window to put it with.
     pending_filter: Option<String>,
@@ -173,7 +175,8 @@ impl Shell {
                 .placeholder(rust_i18n::t!("table.namespace_placeholder").to_string())
         });
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), window, cx));
-        let table = cx.new(|cx| ResourceTable::new(store.clone(), cx));
+        let table =
+            cx.new(|cx| ResourceTable::new(store.clone(), settings.table_columns.clone(), cx));
         let detail = cx.new(|cx| Detail::new(store.clone(), window, cx));
         let palette = cx.new(|cx| Palette::new(store.clone(), window, cx));
 
@@ -210,6 +213,19 @@ impl Shell {
                 if !this.layout.is_open(Panel::RightPanel) {
                     this.toggle(Panel::RightPanel, cx);
                 }
+            }
+            TableEvent::ColumnsChanged {
+                resource,
+                preferences,
+            } => {
+                if preferences.is_empty() {
+                    this.settings.table_columns.remove(resource);
+                } else {
+                    this.settings
+                        .table_columns
+                        .insert(resource.clone(), preferences.clone());
+                }
+                this.persist();
             }
         }));
         subscriptions.push(
@@ -266,6 +282,7 @@ impl Shell {
             palette,
             showing_palette: false,
             open_palette_pending: false,
+            open_columns_pending: false,
             pending_filter: None,
             open_at_launch: None,
             tab_at_launch: None,
@@ -622,6 +639,14 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the current table's column panel after discovery has landed.
+    ///
+    /// Used by `KIRIKUMO_DEMO_COLUMNS=1` for deterministic visual checks.
+    pub fn open_columns_at_launch(&mut self, cx: &mut Context<Self>) {
+        self.open_columns_pending = true;
+        cx.notify();
+    }
+
     /// `⌘K`: open the palette, or close it if it is already open.
     fn on_toggle_palette(
         &mut self,
@@ -964,6 +989,18 @@ impl Shell {
             cx,
             |this, _, cx| this.refresh(cx),
         );
+        let columns = self.icon_button(
+            "columns",
+            Icon::empty()
+                .path(icon::SETTINGS)
+                .size_4()
+                .text_color(tokens.colors().text_secondary),
+            rust_i18n::t!("table.columns.open").to_string(),
+            cx,
+            |this, _, cx| {
+                this.table.update(cx, |table, cx| table.toggle_columns(cx));
+            },
+        );
         let right_toggle = self.panel_toggle(
             Panel::RightPanel,
             IconName::PanelRightClose,
@@ -1017,6 +1054,7 @@ impl Shell {
                             .flex_shrink_0()
                             .child(Input::new(&self.filter).cleanable(true)),
                     )
+                    .child(columns)
                     .child(refresh)
                     .child(right_toggle),
             );
@@ -1070,6 +1108,10 @@ impl Render for Shell {
         if self.open_palette_pending && self.store.read(cx).catalogue().value().is_some() {
             self.open_palette_pending = false;
             self.on_toggle_palette(&TogglePalette, window, cx);
+        }
+        if self.open_columns_pending && self.table.read(cx).kind().is_some() {
+            self.open_columns_pending = false;
+            self.table.update(cx, |table, cx| table.toggle_columns(cx));
         }
         let tokens = Tokens::global(cx).clone();
         let standard = tokens.duration_ms.standard();

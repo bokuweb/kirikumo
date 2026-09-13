@@ -72,11 +72,12 @@ As Ginka §3.1: each column paints itself to the top and carries a 44 px strip; 
 
 ### 3.3 Centre — the table
 
-The centre strip carries the kind's name and the namespace it is scoped to, then the **namespace picker** (a chip that opens a filterable list, with *All namespaces* at the top and disabled for cluster-scoped kinds), the **filter box** (240 px, fuzzy over every cell in the row, live as it is typed), refresh, and the right-panel toggle.
+The centre strip carries the kind's name and the namespace it is scoped to, then the **namespace picker** (a chip that opens a filterable list, with *All namespaces* at the top and disabled for cluster-scoped kinds), the **filter box** (240 px, fuzzy over every cell in the row, live as it is typed), column settings, refresh, and the right-panel toggle. Column settings opens a table-local panel: a visible mark, up/down controls, narrower/wider steps and *Auto* per heading, plus *Reset*. NAME is fixed visible because it is the row identity; everything else may be hidden. Preferences are per resource and store only headings, order, visibility and optional pixel widths.
 
 A `uniform_list` of 28 px rows under a sticky header:
 
 - The **health mark** in the first 16 px, then the columns for the kind. The column set is `kubectl get`'s, per kind. A custom resource gets the columns its CRD declares, between NAME and AGE, headings upper-cased the way `kubectl` prints them, numeric ones right-aligned and `date` ones as ages; a CRD that declares none — and anything else with no set of its own — gets Name, Namespace (when namespaced), and Age.
+- Reader column preferences reconcile against that default on every discovery: removed CRD columns are dropped and newly added ones appear at the end rather than being silently hidden by an older setting.
 - Names in mono; ages as the shortest unit that says it (`3d`, `2h17m`, `45s`), as `kubectl` writes them.
 - The header is clickable and sorts; the arrow says which way. The default is the kind's own: Age descending for Pods and Events, name ascending otherwise.
 - Selecting a row draws it in `row.active` and opens it on the right; the table never navigates away underneath.

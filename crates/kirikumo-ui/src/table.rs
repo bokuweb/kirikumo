@@ -19,6 +19,8 @@ use kirikumo_kube::{
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::settings::ColumnPreference;
+
 /// How a column takes its share of the table's width.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Width {
@@ -371,6 +373,89 @@ impl ColumnSet {
     /// The headings, in order.
     pub fn columns(&self) -> impl Iterator<Item = &Column> {
         self.columns.iter().map(|(column, _)| column)
+    }
+
+    /// Apply a reader's saved order, visibility and widths to this set.
+    ///
+    /// Unknown entries are ignored and new server-provided columns are
+    /// appended in their default order, so a CRD upgrade cannot make new
+    /// information disappear. NAME is never hidden: it is the row's identity
+    /// and the target of opening the detail panel.
+    pub fn with_preferences(mut self, preferences: &[ColumnPreference]) -> Self {
+        let default_sort_name = self
+            .columns
+            .get(self.default_sort)
+            .map(|(column, _)| column.title.clone());
+        let mut remaining = std::mem::take(&mut self.columns);
+        let mut configured = Vec::with_capacity(remaining.len());
+        for preference in preferences {
+            let Some(index) = remaining
+                .iter()
+                .position(|(column, _)| column.title == preference.name)
+            else {
+                continue;
+            };
+            let (mut column, cell) = remaining.remove(index);
+            if preference.hidden && column.title != "NAME" {
+                continue;
+            }
+            if let Some(width) = preference
+                .width
+                .filter(|width| width.is_finite())
+                .map(|width| width.clamp(48.0, 600.0))
+            {
+                column.width = Width::Fixed(width);
+            }
+            configured.push((column, cell));
+        }
+        configured.append(&mut remaining);
+        self.columns = configured;
+        self.default_sort = default_sort_name
+            .as_deref()
+            .and_then(|name| {
+                self.columns
+                    .iter()
+                    .position(|(column, _)| column.title == name)
+            })
+            .unwrap_or_else(|| {
+                self.default_ascending = true;
+                0
+            });
+        self
+    }
+
+    /// Reconcile saved entries with the columns served by the cluster now.
+    ///
+    /// The answer is complete and ordered, including hidden columns, which
+    /// makes it suitable for a column picker. Stale entries disappear and
+    /// newly discovered entries are visible at the end.
+    pub fn resolved_preferences(&self, preferences: &[ColumnPreference]) -> Vec<ColumnPreference> {
+        let mut remaining: Vec<&str> = self
+            .columns
+            .iter()
+            .map(|(column, _)| column.title.as_str())
+            .collect();
+        let mut resolved = Vec::with_capacity(remaining.len());
+        for preference in preferences {
+            let Some(index) = remaining.iter().position(|name| *name == preference.name) else {
+                continue;
+            };
+            let name = remaining.remove(index);
+            resolved.push(ColumnPreference {
+                name: name.to_string(),
+                width: preference
+                    .width
+                    .filter(|width| width.is_finite())
+                    .map(|width| width.clamp(48.0, 600.0)),
+                hidden: preference.hidden && name != "NAME",
+            });
+        }
+        resolved.extend(
+            remaining
+                .into_iter()
+                .map(|name| ColumnPreference::shown(name, None)),
+        );
+        resolved
     }
 
     /// How many columns there are.
@@ -804,6 +889,7 @@ pub fn worst(rows: &[Row]) -> Level {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::ColumnPreference;
     use serde_json::json;
 
     fn object(value: serde_json::Value) -> Object {
@@ -1330,5 +1416,50 @@ mod tests {
         }));
         assert!(columns.cells(&claim, now()).contains(&"50Gi".to_string()));
         assert_eq!(as_bytes("50Gi").as_deref(), Some("50Gi"));
+    }
+
+    #[test]
+    fn preferences_reorder_resize_and_hide_columns_without_changing_cells() {
+        let defaults = ColumnSet::for_kind("Deployment", true, false);
+        let columns = defaults.with_preferences(&[
+            ColumnPreference::shown("AVAILABLE", Some(140.0)),
+            ColumnPreference::shown("NAME", Some(260.0)),
+            ColumnPreference::hidden("IMAGES"),
+        ]);
+        let titles: Vec<&str> = columns
+            .columns()
+            .map(|column| column.title.as_str())
+            .collect();
+
+        assert_eq!(
+            titles,
+            vec!["AVAILABLE", "NAME", "READY", "UP-TO-DATE", "AGE"]
+        );
+        assert_eq!(columns.columns().next().unwrap().width, Width::Fixed(140.0));
+        assert_eq!(columns.cells(&pod(), now()).len(), titles.len());
+    }
+
+    #[test]
+    fn name_stays_visible_and_unknown_preferences_do_not_hide_new_defaults() {
+        let defaults = ColumnSet::for_kind("Pod", true, false);
+        let columns = defaults.with_preferences(&[
+            ColumnPreference::hidden("NAME"),
+            ColumnPreference::hidden("REMOVED BY THE CLUSTER"),
+        ]);
+        let titles: Vec<&str> = columns
+            .columns()
+            .map(|column| column.title.as_str())
+            .collect();
+
+        assert_eq!(titles.first(), Some(&"NAME"));
+        assert!(titles.contains(&"STATUS"));
+        assert!(titles.contains(&"AGE"));
+    }
+
+    #[test]
+    fn hiding_the_default_sort_column_falls_back_to_name() {
+        let columns = ColumnSet::for_kind("Pod", true, false)
+            .with_preferences(&[ColumnPreference::hidden("AGE")]);
+        assert_eq!(columns.default_sort(), (0, true));
     }
 }

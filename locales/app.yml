@@ -99,6 +99,18 @@ table.refresh:
 table.rows:
   en: "%{shown} of %{total}"
   ja: "%{total} 件中 %{shown} 件"
+table.columns.open:
+  en: Columns
+  ja: 列の設定
+table.columns.title:
+  en: Columns
+  ja: 列
+table.columns.auto:
+  en: Auto
+  ja: 自動
+table.columns.reset:
+  en: Reset
+  ja: リセット
 
 palette.placeholder:
   en: Go to a kind, a namespace, a cluster…

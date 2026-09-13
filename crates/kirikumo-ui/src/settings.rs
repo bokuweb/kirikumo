@@ -7,7 +7,44 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
+
+/// One reader override for a table column.
+///
+/// Entries are stored in display order. A missing width keeps the built-in
+/// `kubectl get` proportion, while `hidden` removes only that heading and its
+/// already-formatted cell; no Kubernetes payload is persisted with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColumnPreference {
+    /// The heading used to match this preference after discovery runs again.
+    pub name: String,
+    /// A reader-chosen width in pixels, or the built-in width.
+    pub width: Option<f32>,
+    /// Whether this column is omitted from the table.
+    pub hidden: bool,
+}
+
+impl ColumnPreference {
+    /// A visible column, optionally fixed to a width in pixels.
+    pub fn shown(name: impl Into<String>, width: Option<f32>) -> Self {
+        Self {
+            name: name.into(),
+            width,
+            hidden: false,
+        }
+    }
+
+    /// A column omitted from the table.
+    pub fn hidden(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            width: None,
+            hidden: true,
+        }
+    }
+}
 
 /// The window's own settings.
 ///
@@ -38,6 +75,8 @@ pub struct AppSettings {
     pub last_namespace: Option<String>,
     /// The sidebar groups that are folded away, by name.
     pub collapsed_groups: Vec<String>,
+    /// Per-resource table column order, visibility and reader-chosen widths.
+    pub table_columns: BTreeMap<String, Vec<ColumnPreference>>,
 }
 
 impl Default for AppSettings {
@@ -58,6 +97,7 @@ impl Default for AppSettings {
             last_resource: Some("Pod".to_string()),
             last_namespace: None,
             collapsed_groups: Vec::new(),
+            table_columns: BTreeMap::new(),
         }
     }
 }
@@ -171,6 +211,29 @@ mod tests {
         };
         save(&path, &settings).unwrap();
         assert_eq!(load::<AppSettings>(&path), settings);
+    }
+
+    #[test]
+    fn table_column_preferences_round_trip_without_any_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.json");
+        let mut settings = AppSettings::default();
+        settings.table_columns.insert(
+            "Deployment.apps".into(),
+            vec![
+                ColumnPreference::shown("NAME", Some(260.0)),
+                ColumnPreference::hidden("IMAGES"),
+                ColumnPreference::shown("READY", None),
+            ],
+        );
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded: AppSettings = load(&path);
+
+        assert_eq!(loaded, settings);
+        assert!(text.contains("table_columns"));
+        assert!(!text.contains("resourceVersion"));
     }
 
     #[test]
