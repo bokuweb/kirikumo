@@ -1,8 +1,8 @@
 //! The right panel: `docs/ui.md` §3.4.
 //!
 //! Tabs over one object — Overview, Events, YAML, an Argo CD Application's
-//! Resources, a Pod's or selecting workload's Logs, and a Pod's Run and
-//! Shell. What each of them says is decided in `kirikumo_ui`
+//! Resources, a Pod's, selecting workload's or Node's Logs, and a Pod's Run
+//! and Shell. What each of them says is decided in `kirikumo_ui`
 //! (`detail::overview`, `terminal::Screen`) or in
 //! `kirikumo_kube` (`yaml::to_yaml`); this file draws it.
 //!
@@ -315,8 +315,27 @@ impl Detail {
         {
             tab = Tab::Overview;
         }
+        if let Some(object) = self.object(cx)
+            && !self.tab_available(tab, &object)
+        {
+            tab = Tab::Overview;
+        }
         self.attach_when_allowed = tab == Tab::Shell;
         self.set_tab(tab, cx);
+    }
+
+    /// Whether a tab has a real API target for the object now in the panel.
+    fn tab_available(&self, tab: Tab, object: &Object) -> bool {
+        let Some((resource, _, _)) = self.key.as_ref() else {
+            return false;
+        };
+        match tab {
+            Tab::Overview | Tab::Yaml => true,
+            Tab::Resources => is_argo_application(resource),
+            Tab::Events => detail::has_related_events(resource),
+            Tab::Logs => detail::has_log_view(resource, object),
+            Tab::Run | Tab::Shell => detail::has_exec_view(resource, object),
+        }
     }
 
     /// Ask for the log again under whatever the toggles now say.
@@ -336,6 +355,14 @@ impl Detail {
         let Some(object) = self.object(cx) else {
             return;
         };
+        if !self.tab_available(self.tab, &object) {
+            let stopped_log = self.tab == Tab::Logs;
+            self.tab = Tab::Overview;
+            self.attach_when_allowed = false;
+            if stopped_log {
+                self.stop_following(cx);
+            }
+        }
         // Usage is on the Overview, which is the tab this panel opens on, and
         // it is one request per namespace rather than per object.
         let kind = self.kind();
@@ -606,14 +633,13 @@ impl Detail {
     /// The tab chips.
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let tokens = Tokens::global(cx).clone();
-        let has_containers = !self.containers(cx).is_empty();
-        let has_indirect_logs = self.object(cx).is_some_and(|object| {
-            detail::has_workload_logs(&object)
-                || self
-                    .key
-                    .as_ref()
-                    .is_some_and(|(resource, _, _)| is_node(resource))
-        });
+        let object = self.object(cx);
+        let has_logs = object
+            .as_ref()
+            .is_some_and(|object| self.tab_available(Tab::Logs, object));
+        let has_exec = object
+            .as_ref()
+            .is_some_and(|object| self.tab_available(Tab::Run, object));
         let mut tabs = vec![Tab::Overview];
         if self
             .key
@@ -630,10 +656,10 @@ impl Detail {
             tabs.push(Tab::Events);
         }
         tabs.push(Tab::Yaml);
-        if has_containers || has_indirect_logs {
+        if has_logs {
             tabs.push(Tab::Logs);
         }
-        if has_containers {
+        if has_exec {
             tabs.extend([Tab::Run, Tab::Shell]);
         }
         h_flex()

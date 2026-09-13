@@ -118,6 +118,24 @@ pub fn has_workload_logs(workload: &Object) -> bool {
     workload_log_selector(workload).is_some()
 }
 
+/// Whether the apiserver can supply a log surface for this object.
+///
+/// Direct container logs and exec are Pod subresources. Workloads can resolve
+/// an explicit Pod through their selector, while a Node can resolve the Pods
+/// scheduled to it across namespaces.
+pub fn has_log_view(resource: &ResourceKey, object: &Object) -> bool {
+    has_exec_view(resource, object)
+        || (resource.group.is_empty() && resource.kind == "Node")
+        || has_workload_logs(object)
+}
+
+/// Whether the apiserver can run or attach a command directly on this object.
+pub fn has_exec_view(resource: &ResourceKey, object: &Object) -> bool {
+    resource.group.is_empty()
+        && resource.kind == "Pod"
+        && !object.array_at("spec.containers").is_empty()
+}
+
 fn workload_log_selector(workload: &Object) -> Option<&Value> {
     workload.at("spec.template.spec.containers")?;
     let selector = workload.at("spec.selector")?;
@@ -1304,6 +1322,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["kube-system/dns", "shop/api"]
         );
+    }
+
+    #[test]
+    fn log_and_exec_surfaces_only_claim_targets_the_apiserver_can_serve() {
+        let pod_key = ResourceKey::new("", "Pod");
+        let node_key = ResourceKey::new("", "Node");
+        let deployment_key = ResourceKey::new("apps", "Deployment");
+        let config_map_key = ResourceKey::new("", "ConfigMap");
+        let pod = object(json!({
+            "metadata": {"name": "api", "namespace": "shop"},
+            "spec": {"containers": [{"name": "api"}]}
+        }));
+        let node = object(json!({"metadata": {"name": "node-1"}}));
+        let deployment = object(json!({
+            "metadata": {"name": "api", "namespace": "shop"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "api"}},
+                "template": {"spec": {"containers": [{"name": "api"}]}}
+            }
+        }));
+        let misleading_custom_shape = object(json!({
+            "metadata": {"name": "settings", "namespace": "shop"},
+            "spec": {"containers": [{"name": "not-a-pod"}]}
+        }));
+
+        assert!(has_log_view(&pod_key, &pod));
+        assert!(has_exec_view(&pod_key, &pod));
+        assert!(has_log_view(&node_key, &node));
+        assert!(!has_exec_view(&node_key, &node));
+        assert!(has_log_view(&deployment_key, &deployment));
+        assert!(!has_exec_view(&deployment_key, &deployment));
+        assert!(!has_log_view(&config_map_key, &misleading_custom_shape));
+        assert!(!has_exec_view(&config_map_key, &misleading_custom_shape));
     }
 
     #[test]
