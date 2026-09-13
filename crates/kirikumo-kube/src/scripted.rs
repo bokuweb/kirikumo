@@ -116,6 +116,52 @@ impl Scripted {
                 "persistentvolumeclaims",
                 true,
             ),
+            resource("", "v1", "PersistentVolume", "persistentvolumes", false),
+            resource(
+                "storage.k8s.io",
+                "v1",
+                "StorageClass",
+                "storageclasses",
+                false,
+            ),
+            resource("networking.k8s.io", "v1", "Ingress", "ingresses", true),
+            resource(
+                "networking.k8s.io",
+                "v1",
+                "NetworkPolicy",
+                "networkpolicies",
+                true,
+            ),
+            resource(
+                "autoscaling",
+                "v2",
+                "HorizontalPodAutoscaler",
+                "horizontalpodautoscalers",
+                true,
+            ),
+            resource("", "v1", "ServiceAccount", "serviceaccounts", true),
+            resource("rbac.authorization.k8s.io", "v1", "Role", "roles", true),
+            resource(
+                "rbac.authorization.k8s.io",
+                "v1",
+                "ClusterRole",
+                "clusterroles",
+                false,
+            ),
+            resource(
+                "rbac.authorization.k8s.io",
+                "v1",
+                "RoleBinding",
+                "rolebindings",
+                true,
+            ),
+            resource(
+                "rbac.authorization.k8s.io",
+                "v1",
+                "ClusterRoleBinding",
+                "clusterrolebindings",
+                false,
+            ),
             patchable(resource(
                 "argoproj.io",
                 "v1alpha1",
@@ -330,7 +376,8 @@ impl Scripted {
                     "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                     "metadata": {"name": "prometheus-data", "namespace": "observability",
                                  "uid": "pvc-prom", "creationTimestamp": ago(60 * 24 * 30)},
-                    "spec": {"storageClassName": "standard",
+                    "spec": {"storageClassName": "standard", "volumeName": "pvc-prometheus-data",
+                             "accessModes": ["ReadWriteOnce"], "volumeMode": "Filesystem",
                              "resources": {"requests": {"storage": "50Gi"}}},
                     "status": {"phase": "Bound", "capacity": {"storage": "50Gi"}}
                 }),
@@ -343,6 +390,126 @@ impl Scripted {
                     "status": {"phase": "Pending"}
                 }),
             ]),
+        );
+
+        objects.insert(
+            ResourceKey::new("", "PersistentVolume"),
+            parse(vec![json!({
+                "apiVersion": "v1", "kind": "PersistentVolume",
+                "metadata": {"name": "pvc-prometheus-data", "uid": "pv-prom",
+                             "creationTimestamp": ago(60 * 24 * 30)},
+                "spec": {"capacity": {"storage": "50Gi"},
+                         "accessModes": ["ReadWriteOnce"], "volumeMode": "Filesystem",
+                         "persistentVolumeReclaimPolicy": "Delete", "storageClassName": "standard",
+                         "claimRef": {"namespace": "observability", "name": "prometheus-data"},
+                         "csi": {"driver": "hostpath.csi.k8s.io", "volumeHandle": "prometheus-data"}},
+                "status": {"phase": "Bound"}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("storage.k8s.io", "StorageClass"),
+            parse(vec![json!({
+                "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
+                "metadata": {"name": "standard", "uid": "sc-standard",
+                             "creationTimestamp": ago(60 * 24 * 40)},
+                "provisioner": "hostpath.csi.k8s.io", "reclaimPolicy": "Delete",
+                "volumeBindingMode": "WaitForFirstConsumer", "allowVolumeExpansion": true,
+                "parameters": {"type": "hostpath"}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("networking.k8s.io", "Ingress"),
+            parse(vec![json!({
+                "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
+                "metadata": {"name": "shop", "namespace": "shop", "uid": "ing-shop",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "spec": {"ingressClassName": "nginx",
+                         "tls": [{"hosts": ["shop.example.com"], "secretName": "shop-tls"}],
+                         "rules": [{"host": "shop.example.com", "http": {"paths": [{
+                             "path": "/", "pathType": "Prefix",
+                             "backend": {"service": {"name": "web", "port": {"number": 443}}}
+                         }]}}]},
+                "status": {"loadBalancer": {"ingress": [{"ip": "203.0.113.10"}]}}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("networking.k8s.io", "NetworkPolicy"),
+            parse(vec![json!({
+                "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+                "metadata": {"name": "api", "namespace": "shop", "uid": "netpol-api",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "spec": {"podSelector": {"matchLabels": {"app": "api"}},
+                         "policyTypes": ["Ingress", "Egress"],
+                         "ingress": [{"from": [{"podSelector": {"matchLabels": {"app": "web"}}}],
+                                      "ports": [{"port": 8080, "protocol": "TCP"}]}],
+                         "egress": []}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("autoscaling", "HorizontalPodAutoscaler"),
+            parse(vec![json!({
+                "apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
+                "metadata": {"name": "api", "namespace": "shop", "uid": "hpa-api",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "spec": {"scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "api"},
+                         "minReplicas": 2, "maxReplicas": 10,
+                         "metrics": [{"type": "Resource", "resource": {"name": "cpu",
+                             "target": {"type": "Utilization", "averageUtilization": 70}}}]},
+                "status": {"currentReplicas": 2, "desiredReplicas": 3,
+                           "currentMetrics": [{"type": "Resource", "resource": {"name": "cpu",
+                               "current": {"averageUtilization": 82}}}]}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("", "ServiceAccount"),
+            parse(vec![json!({
+                "apiVersion": "v1", "kind": "ServiceAccount",
+                "metadata": {"name": "api", "namespace": "shop", "uid": "sa-api",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "automountServiceAccountToken": false,
+                "imagePullSecrets": [{"name": "registry"}]
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("rbac.authorization.k8s.io", "Role"),
+            parse(vec![json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+                "metadata": {"name": "reader", "namespace": "shop", "uid": "role-reader",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "rules": [{"apiGroups": ["", "apps"], "resources": ["pods", "deployments"],
+                           "verbs": ["get", "list", "watch"]}]
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("rbac.authorization.k8s.io", "ClusterRole"),
+            parse(vec![json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+                "metadata": {"name": "namespace-reader", "uid": "clusterrole-reader",
+                             "creationTimestamp": ago(60 * 24 * 40)},
+                "rules": [{"apiGroups": [""], "resources": ["namespaces"], "verbs": ["get", "list"]}]
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("rbac.authorization.k8s.io", "RoleBinding"),
+            parse(vec![json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                "metadata": {"name": "api-readers", "namespace": "shop", "uid": "rb-api",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "reader"},
+                "subjects": [{"kind": "ServiceAccount", "namespace": "shop", "name": "api"},
+                             {"kind": "Group", "name": "developers"}]
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("rbac.authorization.k8s.io", "ClusterRoleBinding"),
+            parse(vec![json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding",
+                "metadata": {"name": "namespace-readers", "uid": "crb-readers",
+                             "creationTimestamp": ago(60 * 24 * 40)},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole",
+                            "name": "namespace-reader"},
+                "subjects": [{"kind": "Group", "name": "developers"}]
+            })]),
         );
 
         // The CRD behind the custom resource below, with the columns its

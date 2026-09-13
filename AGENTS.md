@@ -24,6 +24,8 @@ When Argo CD is installed, its Applications, ApplicationSets and AppProjects get
 
 `⌘K` reaches every kind, namespace, context and command by name; the detail panel links up to an object's controller and node and down to what a selector selects, with an explicit Pod logs route from a Deployment, reports what a pod or node is using when the cluster has a metrics server, and **follows a container's log** with a previous-instance toggle and a literal find. **It can act**: sync an Argo CD Application, scale, restart, trigger/suspend/resume a CronJob, cordon/uncordon/drain, delete, and apply an edited manifest, each behind a second button that names the object and each greyed out when RBAC says no. **A pod's ports forward to `localhost`** from a chip, one WebSocket per local connection, **a command runs in a container** from a *Run* tab, with its output and exit code, and **a shell attaches to a container** on a *Shell* tab, drawn by `alacritty_terminal` at the version Ginka uses. See `docs/roadmap.md` §5.
 
+Storage, networking, autoscaling and access-control built-ins have compact native Overview sections over their unstructured JSON: PV/PVC binding, StorageClass policy, Ingress routes and TLS, NetworkPolicy isolation, HPA progress, and RBAC rules and subjects. ServiceAccount summaries show secret reference names only. Unknown kinds retain the generic metadata, conditions and YAML path.
+
 ## Commands
 
 ```bash
