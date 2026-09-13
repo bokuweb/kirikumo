@@ -49,6 +49,152 @@ pub fn has_related_events(resource: &ResourceKey) -> bool {
     !(resource.kind == "Event" && (resource.group.is_empty() || resource.group == "events.k8s.io"))
 }
 
+/// Pods whose labels satisfy a workload's selector, newest first.
+///
+/// Only objects with both a pod template and a non-empty label selector are
+/// treated as workloads. This keeps a Service or an empty selector from
+/// accidentally turning a Logs tab into a namespace-wide log picker.
+pub fn workload_log_pods<'a>(workload: &Object, pods: &'a [Object]) -> Vec<&'a Object> {
+    let Some(selector) = workload_log_selector(workload) else {
+        return Vec::new();
+    };
+    let mut match_labels = selector
+        .get("matchLabels")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(fields) = selector.as_object() {
+        match_labels.extend(
+            fields
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "matchLabels" | "matchExpressions"))
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    let expressions = selector
+        .get("matchExpressions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if match_labels.is_empty() && expressions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matched: Vec<&Object> = pods
+        .iter()
+        .filter(|pod| pod.meta.namespace == workload.meta.namespace)
+        .filter(|pod| {
+            match_labels.iter().all(|(key, value)| {
+                value.as_str().is_some_and(|value| {
+                    pod.meta.labels.get(key).is_some_and(|label| label == value)
+                })
+            }) && expressions
+                .iter()
+                .all(|expression| selector_expression_matches(expression, &pod.meta.labels))
+        })
+        .collect();
+    sort_pods_newest_first(&mut matched);
+    matched
+}
+
+/// Pods scheduled to a Node, across every namespace, newest first.
+///
+/// Kubernetes has no Node logs subresource. A Node log surface therefore has
+/// to name the actual Pod and container whose output it is showing.
+pub fn node_log_pods<'a>(node: &Object, pods: &'a [Object]) -> Vec<&'a Object> {
+    if node.meta.name.is_empty() {
+        return Vec::new();
+    }
+    let mut matched: Vec<&Object> = pods
+        .iter()
+        .filter(|pod| pod.str_at("spec.nodeName") == node.meta.name)
+        .collect();
+    sort_pods_newest_first(&mut matched);
+    matched
+}
+
+/// Whether an object can resolve container logs through selected Pods.
+pub fn has_workload_logs(workload: &Object) -> bool {
+    workload_log_selector(workload).is_some()
+}
+
+/// Whether the apiserver can supply a log surface for this object.
+///
+/// Direct container logs and exec are Pod subresources. Workloads can resolve
+/// an explicit Pod through their selector, while a Node can resolve the Pods
+/// scheduled to it across namespaces.
+pub fn has_log_view(resource: &ResourceKey, object: &Object) -> bool {
+    has_exec_view(resource, object)
+        || (resource.group.is_empty() && resource.kind == "Node")
+        || has_workload_logs(object)
+}
+
+/// Whether the apiserver can run or attach a command directly on this object.
+pub fn has_exec_view(resource: &ResourceKey, object: &Object) -> bool {
+    resource.group.is_empty()
+        && resource.kind == "Pod"
+        && !object.array_at("spec.containers").is_empty()
+}
+
+fn workload_log_selector(workload: &Object) -> Option<&Value> {
+    workload.at("spec.template.spec.containers")?;
+    let selector = workload.at("spec.selector")?;
+    let has_labels = selector
+        .get("matchLabels")
+        .and_then(Value::as_object)
+        .is_some_and(|labels| !labels.is_empty());
+    let has_expressions = selector
+        .get("matchExpressions")
+        .and_then(Value::as_array)
+        .is_some_and(|expressions| !expressions.is_empty());
+    let has_legacy_labels = selector.as_object().is_some_and(|fields| {
+        fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "matchLabels" | "matchExpressions"))
+    });
+    (has_labels || has_expressions || has_legacy_labels).then_some(selector)
+}
+
+fn selector_expression_matches(
+    expression: &Value,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let Some(key) = expression.get("key").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(operator) = expression.get("operator").and_then(Value::as_str) else {
+        return false;
+    };
+    let values: Vec<&str> = expression
+        .get("values")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    match operator {
+        "In" => labels
+            .get(key)
+            .is_some_and(|label| values.contains(&label.as_str())),
+        "NotIn" => labels
+            .get(key)
+            .is_none_or(|label| !values.contains(&label.as_str())),
+        "Exists" => labels.contains_key(key),
+        "DoesNotExist" => !labels.contains_key(key),
+        _ => false,
+    }
+}
+
+fn sort_pods_newest_first(pods: &mut Vec<&Object>) {
+    pods.sort_by(|left, right| {
+        right
+            .meta
+            .created
+            .cmp(&left.meta.created)
+            .then_with(|| left.meta.name.cmp(&right.meta.name))
+    });
+}
+
 /// One labelled fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fact {
@@ -1028,6 +1174,215 @@ mod tests {
                 namespace: Some("shop".into()),
                 query: "app=api".into(),
             })
+        );
+    }
+
+    #[test]
+    fn workload_logs_choose_matching_pods_newest_first() {
+        let deployment = object(json!({
+            "metadata": {"name": "api", "namespace": "shop"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "api", "tier": "backend"}},
+                "template": {"spec": {"containers": [{"name": "api"}]}}
+            }
+        }));
+        let pods = vec![
+            object(json!({
+                "metadata": {"name": "wrong", "namespace": "shop",
+                    "creationTimestamp": "2026-09-07T12:03:00Z",
+                    "labels": {"app": "api", "tier": "frontend"}},
+                "spec": {"containers": [{"name": "api"}]}
+            })),
+            object(json!({
+                "metadata": {"name": "old", "namespace": "shop",
+                    "creationTimestamp": "2026-09-07T12:01:00Z",
+                    "labels": {"app": "api", "tier": "backend"}},
+                "spec": {"containers": [{"name": "api"}]}
+            })),
+            object(json!({
+                "metadata": {"name": "new", "namespace": "shop",
+                    "creationTimestamp": "2026-09-07T12:02:00Z",
+                    "labels": {"app": "api", "tier": "backend"}},
+                "spec": {"containers": [{"name": "api"}]}
+            })),
+        ];
+
+        assert_eq!(
+            workload_log_pods(&deployment, &pods)
+                .into_iter()
+                .map(|pod| pod.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new", "old"]
+        );
+    }
+
+    #[test]
+    fn workload_logs_honour_selector_expressions() {
+        let workload = object(json!({
+            "metadata": {"name": "api", "namespace": "shop"},
+            "spec": {
+                "selector": {"matchExpressions": [
+                    {"key": "track", "operator": "In", "values": ["stable", "canary"]},
+                    {"key": "debug", "operator": "DoesNotExist"}
+                ]},
+                "template": {"spec": {"containers": [{"name": "api"}]}}
+            }
+        }));
+        let pods = vec![
+            object(json!({"metadata": {"name": "stable", "namespace": "shop",
+                "labels": {"track": "stable"}}})),
+            object(json!({"metadata": {"name": "debug", "namespace": "shop",
+                "labels": {"track": "canary", "debug": "true"}}})),
+            object(json!({"metadata": {"name": "edge", "namespace": "shop",
+                "labels": {"track": "edge"}}})),
+        ];
+
+        assert_eq!(
+            workload_log_pods(&workload, &pods)
+                .into_iter()
+                .map(|pod| pod.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stable"]
+        );
+    }
+
+    #[test]
+    fn an_empty_selector_never_becomes_namespace_wide_logs() {
+        let workload = object(json!({
+            "metadata": {"name": "unsafe", "namespace": "shop"},
+            "spec": {
+                "selector": {},
+                "template": {"spec": {"containers": [{"name": "app"}]}}
+            }
+        }));
+        let pods = vec![object(json!({
+            "metadata": {"name": "someone-elses", "namespace": "shop"}
+        }))];
+
+        assert!(!has_workload_logs(&workload));
+        assert!(workload_log_pods(&workload, &pods).is_empty());
+    }
+
+    #[test]
+    fn a_replication_controllers_legacy_selector_can_pick_log_pods() {
+        let controller = object(json!({
+            "metadata": {"name": "api", "namespace": "shop"},
+            "spec": {
+                "selector": {"app": "api"},
+                "template": {"spec": {"containers": [{"name": "api"}]}}
+            }
+        }));
+        let pods = vec![
+            object(json!({"metadata": {"name": "api-1", "namespace": "shop",
+                "labels": {"app": "api"}}})),
+            object(json!({"metadata": {"name": "web-1", "namespace": "shop",
+                "labels": {"app": "web"}}})),
+        ];
+
+        assert_eq!(
+            workload_log_pods(&controller, &pods)
+                .into_iter()
+                .map(|pod| pod.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["api-1"]
+        );
+    }
+
+    #[test]
+    fn node_logs_choose_scheduled_pods_across_namespaces_newest_first() {
+        let node = object(json!({"metadata": {"name": "node-1"}}));
+        let pods = vec![
+            object(json!({
+                "metadata": {"name": "api", "namespace": "shop",
+                    "creationTimestamp": "2026-09-07T12:01:00Z"},
+                "spec": {"nodeName": "node-1", "containers": [{"name": "api"}]}
+            })),
+            object(json!({
+                "metadata": {"name": "dns", "namespace": "kube-system",
+                    "creationTimestamp": "2026-09-07T12:02:00Z"},
+                "spec": {"nodeName": "node-1", "containers": [{"name": "dns"}]}
+            })),
+            object(json!({
+                "metadata": {"name": "elsewhere", "namespace": "shop",
+                    "creationTimestamp": "2026-09-07T12:03:00Z"},
+                "spec": {"nodeName": "node-2", "containers": [{"name": "api"}]}
+            })),
+        ];
+
+        assert_eq!(
+            node_log_pods(&node, &pods)
+                .into_iter()
+                .map(|pod| {
+                    format!(
+                        "{}/{}",
+                        pod.meta.namespace.as_deref().unwrap_or_default(),
+                        pod.meta.name
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec!["kube-system/dns", "shop/api"]
+        );
+    }
+
+    #[test]
+    fn log_and_exec_surfaces_only_claim_targets_the_apiserver_can_serve() {
+        let pod_key = ResourceKey::new("", "Pod");
+        let node_key = ResourceKey::new("", "Node");
+        let deployment_key = ResourceKey::new("apps", "Deployment");
+        let config_map_key = ResourceKey::new("", "ConfigMap");
+        let pod = object(json!({
+            "metadata": {"name": "api", "namespace": "shop"},
+            "spec": {"containers": [{"name": "api"}]}
+        }));
+        let node = object(json!({"metadata": {"name": "node-1"}}));
+        let deployment = object(json!({
+            "metadata": {"name": "api", "namespace": "shop"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "api"}},
+                "template": {"spec": {"containers": [{"name": "api"}]}}
+            }
+        }));
+        let misleading_custom_shape = object(json!({
+            "metadata": {"name": "settings", "namespace": "shop"},
+            "spec": {"containers": [{"name": "not-a-pod"}]}
+        }));
+
+        assert!(has_log_view(&pod_key, &pod));
+        assert!(has_exec_view(&pod_key, &pod));
+        assert!(has_log_view(&node_key, &node));
+        assert!(!has_exec_view(&node_key, &node));
+        assert!(has_log_view(&deployment_key, &deployment));
+        assert!(!has_exec_view(&deployment_key, &deployment));
+        assert!(!has_log_view(&config_map_key, &misleading_custom_shape));
+        assert!(!has_exec_view(&config_map_key, &misleading_custom_shape));
+    }
+
+    #[test]
+    fn workload_logs_support_exists_and_not_in_expressions() {
+        let workload = object(json!({
+            "metadata": {"name": "api", "namespace": "shop"},
+            "spec": {
+                "selector": {"matchExpressions": [
+                    {"key": "app", "operator": "Exists"},
+                    {"key": "track", "operator": "NotIn", "values": ["retired"]}
+                ]},
+                "template": {"spec": {"containers": [{"name": "api"}]}}
+            }
+        }));
+        let pods = vec![
+            object(json!({"metadata": {"name": "current", "namespace": "shop",
+                "labels": {"app": "api", "track": "stable"}}})),
+            object(json!({"metadata": {"name": "retired", "namespace": "shop",
+                "labels": {"app": "api", "track": "retired"}}})),
+            object(json!({"metadata": {"name": "unlabelled", "namespace": "shop"}})),
+        ];
+
+        assert_eq!(
+            workload_log_pods(&workload, &pods)
+                .into_iter()
+                .map(|pod| pod.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current"]
         );
     }
 

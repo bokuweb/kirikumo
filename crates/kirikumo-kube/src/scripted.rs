@@ -504,6 +504,17 @@ impl Scripted {
                 last: Some(now - Duration::minutes(1)),
             }],
         );
+        events.insert(
+            "node-node-1".to_string(),
+            vec![EventRecord {
+                kind: "Normal".into(),
+                reason: "NodeReady".into(),
+                message: "Node node-1 status is now: NodeReady".into(),
+                source: "kubelet".into(),
+                count: 1,
+                last: Some(now - Duration::minutes(4)),
+            }],
+        );
 
         Self {
             version: ClusterVersion {
@@ -1466,6 +1477,9 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let node_events = cluster.events_for("node-node-1", None).unwrap();
+        assert_eq!(node_events.len(), 1);
+        assert_eq!(node_events[0].reason, "NodeReady");
     }
 
     #[test]

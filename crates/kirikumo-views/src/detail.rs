@@ -1,8 +1,9 @@
 //! The right panel: `docs/ui.md` §3.4.
 //!
 //! Tabs over one object — Overview, Events, YAML, an Argo CD Application's
-//! Resources, and for anything with containers Logs, Run and Shell. What each of them says is decided in
-//! `kirikumo_ui` (`detail::overview`, `terminal::Screen`) or in
+//! Resources, a Pod's, selecting workload's or Node's Logs, and a Pod's Run
+//! and Shell. What each of them says is decided in `kirikumo_ui`
+//! (`detail::overview`, `terminal::Screen`) or in
 //! `kirikumo_kube` (`yaml::to_yaml`); this file draws it.
 //!
 //! The object itself is read out of the list the table is already showing
@@ -14,6 +15,7 @@ use chrono::Utc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, StyledExt as _, h_flex, v_flex};
 use kirikumo_kube::{Action, ExecRequest, LogRequest, Object, actions, yaml};
@@ -26,6 +28,9 @@ use serde_json::Value;
 
 /// How tall one line of YAML or of a log is.
 const LINE_HEIGHT: Pixels = px(17.);
+
+/// A log control row stays outside the virtualized log's paint bounds.
+const LOG_TOOLBAR_HEIGHT: Pixels = px(38.);
 
 /// The size the shell's text is drawn at.
 const SHELL_FONT_SIZE: Pixels = px(12.5);
@@ -81,6 +86,8 @@ pub struct Detail {
     store: Entity<Store>,
     key: Option<ObjectKey>,
     tab: Tab,
+    /// Which Pod supplies a workload's or Node's log. A Pod detail needs no choice.
+    pod: Option<(Option<String>, String)>,
     /// Which container's log is showing, when the object has more than one.
     container: Option<String>,
     /// Whether the log is being followed as the container writes.
@@ -178,6 +185,7 @@ impl Detail {
             store,
             key: None,
             tab: Tab::Overview,
+            pod: None,
             container: None,
             // Following is what a person opening a log wants; a tail that
             // stops the moment it is drawn is a screenshot.
@@ -208,6 +216,7 @@ impl Detail {
             // down a list of pods with the YAML tab open wants the next
             // pod's YAML — but the container does not, since it named one
             // of the last object's, and neither does a shell into it.
+            self.pod = None;
             self.container = None;
             self.store.update(cx, |store, _| store.detach_shell());
         }
@@ -247,6 +256,7 @@ impl Detail {
     /// Fetch again whatever the open tab is showing.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.tab == Tab::Logs {
+            self.refresh_log_pods(cx);
             self.reload_log(cx);
             return;
         }
@@ -271,7 +281,10 @@ impl Detail {
         // will not: it asks only for what has never been asked for, and this
         // log's lines are still here from last time.
         match entering_logs {
-            true => self.reload_log(cx),
+            true => {
+                self.ensure(cx);
+                self.reload_log(cx);
+            }
             false => self.ensure(cx),
         }
         cx.notify();
@@ -305,8 +318,27 @@ impl Detail {
         {
             tab = Tab::Overview;
         }
+        if let Some(object) = self.object(cx)
+            && !self.tab_available(tab, &object)
+        {
+            tab = Tab::Overview;
+        }
         self.attach_when_allowed = tab == Tab::Shell;
         self.set_tab(tab, cx);
+    }
+
+    /// Whether a tab has a real API target for the object now in the panel.
+    fn tab_available(&self, tab: Tab, object: &Object) -> bool {
+        let Some((resource, _, _)) = self.key.as_ref() else {
+            return false;
+        };
+        match tab {
+            Tab::Overview | Tab::Yaml => true,
+            Tab::Resources => is_argo_application(resource),
+            Tab::Events => detail::has_related_events(resource),
+            Tab::Logs => detail::has_log_view(resource, object),
+            Tab::Run | Tab::Shell => detail::has_exec_view(resource, object),
+        }
     }
 
     /// Ask for the log again under whatever the toggles now say.
@@ -326,6 +358,14 @@ impl Detail {
         let Some(object) = self.object(cx) else {
             return;
         };
+        if !self.tab_available(self.tab, &object) {
+            let stopped_log = self.tab == Tab::Logs;
+            self.tab = Tab::Overview;
+            self.attach_when_allowed = false;
+            if stopped_log {
+                self.stop_following(cx);
+            }
+        }
         // Usage is on the Overview, which is the tab this panel opens on, and
         // it is one request per namespace rather than per object.
         let kind = self.kind();
@@ -363,6 +403,15 @@ impl Detail {
                     .update(cx, |store, cx| store.ensure_events(uid, namespace, cx));
             }
             Tab::Logs => {
+                if let Some(namespace) = self.indirect_log_namespace(&object) {
+                    self.store.update(cx, |store, cx| {
+                        store.ensure_list(
+                            kirikumo_kube::ResourceKey::new("", "Pod"),
+                            namespace.as_deref(),
+                            cx,
+                        )
+                    });
+                }
                 if let Some(request) = self.log_request(cx) {
                     let following = self.following;
                     // Only when nothing has been asked for yet: `ensure` runs
@@ -421,17 +470,103 @@ impl Detail {
             .unwrap_or_default()
     }
 
+    /// Whether this panel resolves a workload or Node to an explicit Pod.
+    fn indirect_log_namespace(&self, object: &Object) -> Option<Option<String>> {
+        if detail::has_workload_logs(object) {
+            return Some(object.meta.namespace.clone());
+        }
+        self.key
+            .as_ref()
+            .is_some_and(|(resource, _, _)| is_node(resource))
+            .then_some(None)
+    }
+
+    /// Pods selected by the workload or Node in this panel, newest first.
+    fn log_pods(&self, cx: &App) -> Vec<Object> {
+        let Some(subject) = self.object(cx) else {
+            return Vec::new();
+        };
+        let Some(namespace) = self.indirect_log_namespace(&subject) else {
+            return Vec::new();
+        };
+        let pod_key = kirikumo_kube::ResourceKey::new("", "Pod");
+        let Some(pods) = self
+            .store
+            .read(cx)
+            .list(&pod_key, namespace.as_deref())
+            .and_then(|fetch| fetch.value())
+        else {
+            return Vec::new();
+        };
+        let selected = match self
+            .key
+            .as_ref()
+            .is_some_and(|(resource, _, _)| is_node(resource))
+        {
+            true => detail::node_log_pods(&subject, &pods.items),
+            false => detail::workload_log_pods(&subject, &pods.items),
+        };
+        selected.into_iter().cloned().collect()
+    }
+
+    /// The Pod whose log is currently selected.
+    fn log_pod(&self, cx: &App) -> Option<Object> {
+        let object = self.object(cx)?;
+        if self.indirect_log_namespace(&object).is_none() {
+            return Some(object);
+        }
+        let pods = self.log_pods(cx);
+        self.pod
+            .as_ref()
+            .and_then(|(namespace, name)| {
+                pods.iter()
+                    .find(|pod| &pod.meta.namespace == namespace && &pod.meta.name == name)
+            })
+            .or_else(|| pods.first())
+            .cloned()
+    }
+
+    /// Containers on the Pod currently supplying the log.
+    fn log_containers(&self, cx: &App) -> Vec<String> {
+        self.log_pod(cx)
+            .map(|pod| {
+                pod.array_at("spec.containers")
+                    .iter()
+                    .filter_map(|container| container.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn refresh_log_pods(&mut self, cx: &mut Context<Self>) {
+        let Some(subject) = self.object(cx) else {
+            return;
+        };
+        let Some(namespace) = self.indirect_log_namespace(&subject) else {
+            return;
+        };
+        self.store.update(cx, |store, cx| {
+            store.load_list(
+                kirikumo_kube::ResourceKey::new("", "Pod"),
+                namespace.as_deref(),
+                cx,
+            )
+        });
+    }
+
     /// What to ask for on the Logs tab.
     fn log_request(&self, cx: &App) -> Option<LogRequest> {
-        let object = self.object(cx)?;
-        let namespace = object.meta.namespace.clone()?;
-        let containers = self.containers(cx);
+        let pod = self.log_pod(cx)?;
+        let namespace = pod.meta.namespace.clone()?;
+        let containers = self.log_containers(cx);
         let container = self
             .container
             .clone()
+            .filter(|selected| containers.contains(selected))
             .or_else(|| containers.first().cloned())?;
         Some(
-            LogRequest::new(namespace, object.meta.name.clone())
+            LogRequest::new(namespace, pod.meta.name.clone())
                 .container(container)
                 .previous(self.previous),
         )
@@ -501,7 +636,13 @@ impl Detail {
     /// The tab chips.
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let tokens = Tokens::global(cx).clone();
-        let has_containers = !self.containers(cx).is_empty();
+        let object = self.object(cx);
+        let has_logs = object
+            .as_ref()
+            .is_some_and(|object| self.tab_available(Tab::Logs, object));
+        let has_exec = object
+            .as_ref()
+            .is_some_and(|object| self.tab_available(Tab::Run, object));
         let mut tabs = vec![Tab::Overview];
         if self
             .key
@@ -518,8 +659,11 @@ impl Detail {
             tabs.push(Tab::Events);
         }
         tabs.push(Tab::Yaml);
-        if has_containers {
-            tabs.extend([Tab::Logs, Tab::Run, Tab::Shell]);
+        if has_logs {
+            tabs.push(Tab::Logs);
+        }
+        if has_exec {
+            tabs.extend([Tab::Run, Tab::Shell]);
         }
         h_flex()
             .w_full()
@@ -1913,10 +2057,24 @@ impl Detail {
     /// The Logs tab: what to read, and then the reading of it.
     fn logs(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Tokens::global(cx).clone();
-        let containers = self.containers(cx);
+        let subject = self.object(cx);
+        let indirect = subject
+            .as_ref()
+            .is_some_and(|object| self.indirect_log_namespace(object).is_some());
+        let node = self
+            .key
+            .as_ref()
+            .is_some_and(|(resource, _, _)| is_node(resource));
+        let pods = self.log_pods(cx);
+        let current_pod = self
+            .log_pod(cx)
+            .filter(|_| indirect)
+            .map(|pod| (pod.meta.namespace, pod.meta.name));
+        let containers = self.log_containers(cx);
         let current = self
             .container
             .clone()
+            .filter(|selected| containers.contains(selected))
             .or_else(|| containers.first().cloned())
             .unwrap_or_default();
         let fetch = self
@@ -1954,13 +2112,76 @@ impl Detail {
         self.scrolled_last_frame = self.following && arrived;
         self.last_lines = lines.len();
 
-        let toolbar = h_flex()
+        let pod_picker = (indirect && !pods.is_empty()).then(|| {
+            h_flex()
+                .w_full()
+                .h(LOG_TOOLBAR_HEIGHT)
+                .min_h(LOG_TOOLBAR_HEIGHT)
+                .px_3()
+                .pt_1p5()
+                .gap_1()
+                .flex_shrink_0()
+                .items_center()
+                .overflow_x_scrollbar()
+                .child(
+                    div()
+                        .mr_1()
+                        .flex_shrink_0()
+                        .text_size(px(10.5))
+                        .text_color(tokens.colors().text_muted)
+                        .child(rust_i18n::t!("detail.pod").to_string()),
+                )
+                .children(pods.into_iter().enumerate().map(|(index, pod)| {
+                    let name = pod.meta.name;
+                    let namespace = pod.meta.namespace;
+                    let selected =
+                        current_pod
+                            .as_ref()
+                            .is_some_and(|(current_namespace, current_name)| {
+                                current_namespace == &namespace && current_name == &name
+                            });
+                    let picked = (namespace.clone(), name.clone());
+                    let label = match (node, namespace) {
+                        (true, Some(namespace)) => format!("{namespace}/{name}"),
+                        _ => name,
+                    };
+                    div()
+                        .id(("log-pod", index))
+                        .px_2()
+                        .py_0p5()
+                        .flex_shrink_0()
+                        .rounded(px(tokens.radius.control()))
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .font_family("monospace")
+                        .when(selected, |this| {
+                            this.bg(tokens.colors().row_active())
+                                .text_color(tokens.colors().text_primary)
+                        })
+                        .when(!selected, |this| {
+                            this.text_color(tokens.colors().text_muted)
+                        })
+                        .hover(|this| this.bg(tokens.colors().row_hover()))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pod = Some(picked.clone());
+                            this.container = None;
+                            this.stop_following(cx);
+                            this.reload_log(cx);
+                        }))
+                }))
+        });
+
+        let controls = h_flex()
             .w_full()
+            .h(LOG_TOOLBAR_HEIGHT)
+            .min_h(LOG_TOOLBAR_HEIGHT)
             .px_3()
             .py_1p5()
             .gap_1()
             .flex_shrink_0()
             .items_center()
+            .overflow_x_scrollbar()
             .children(containers.into_iter().enumerate().map(|(index, name)| {
                 let selected = name == current;
                 let picked = name.clone();
@@ -2030,6 +2251,32 @@ impl Detail {
                 )
             });
 
+        let toolbar = v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .bg(tokens.colors().bg_terminal)
+            .border_b_1()
+            .border_color(tokens.colors().border_subtle)
+            .children(pod_picker)
+            .child(controls);
+
+        let indirect_pods_fetch = subject.and_then(|object| {
+            let namespace = self.indirect_log_namespace(&object)?;
+            let pod_key = kirikumo_kube::ResourceKey::new("", "Pod");
+            self.store
+                .read(cx)
+                .list(&pod_key, namespace.as_deref())
+                .cloned()
+        });
+        let indirect_pods_loading = indirect
+            && indirect_pods_fetch
+                .as_ref()
+                .is_none_or(|fetch| fetch.is_loading());
+        let indirect_pods_error = indirect_pods_fetch
+            .as_ref()
+            .and_then(|fetch| fetch.error())
+            .map(str::to_string);
+
         let body: AnyElement = if !visible.is_empty() {
             let colors = *tokens.colors();
             // Cloned into the closure rather than read from the store on each
@@ -2059,6 +2306,20 @@ impl Detail {
             .track_scroll(&self.scroll)
             .size_full()
             .into_any_element()
+        } else if indirect_pods_loading {
+            crate::skeleton::detail(cx)
+        } else if let Some(error) = indirect_pods_error {
+            self.notice(error, true, cx)
+        } else if indirect && self.log_pod(cx).is_none() {
+            self.notice(
+                rust_i18n::t!(match node {
+                    true => "detail.node_logs_empty",
+                    false => "detail.workload_logs_empty",
+                })
+                .to_string(),
+                false,
+                cx,
+            )
         } else if let Some(error) = error {
             self.notice(error, true, cx)
         } else if loading {
@@ -2073,7 +2334,15 @@ impl Detail {
             .size_full()
             .bg(tokens.colors().bg_terminal)
             .child(toolbar)
-            .child(div().flex_1().min_h_0().w_full().child(body))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(body),
+            )
             .into_any_element()
     }
 
@@ -2155,6 +2424,11 @@ impl Render for Detail {
 /// Whether this catalogue identity is the Argo CD Application kind.
 fn is_argo_application(resource: &kirikumo_kube::ResourceKey) -> bool {
     resource.group == kirikumo_ui::gitops::ARGO_CD_GROUP && resource.kind == "Application"
+}
+
+/// Whether a resource is the core Node kind.
+fn is_node(resource: &kirikumo_kube::ResourceKey) -> bool {
+    resource.group.is_empty() && resource.kind == "Node"
 }
 
 /// How one span of the shell's screen is drawn.

@@ -68,7 +68,8 @@ fn source(settings: &AppSettings) -> (Arc<dyn Cluster>, Option<KubeConfig>) {
 /// empty for a cluster-scoped kind, and a trailing tab fragment such as
 /// `#resources`, `#events`, `#yaml` or `#logs`. For screenshots — and it goes
 /// through the same path a link in the detail panel does, so it exercises
-/// what a reader would.
+/// what a reader would. A selecting workload may use `#logs` too; for example
+/// `Deployment.apps/shop/api#logs` opens its Pod picker.
 fn open_at_launch() -> Option<(Target, Option<String>)> {
     let value = std::env::var("KIRIKUMO_DEMO_OPEN").ok()?;
     // A trailing fragment opens the matching detail tab.
