@@ -10,7 +10,7 @@
 //! every controller follows, so a custom resource arrives with a working mark
 //! and nobody wrote it (`AGENTS.md` rule 8).
 
-use crate::model::Object;
+use crate::model::{Object, ResourceKey};
 use serde_json::Value;
 
 /// How worried to be.
@@ -98,13 +98,28 @@ const FATAL_WAITING: &[&str] = &[
 /// routinely omit it — the apiserver puts it on the list, not on each entry —
 /// and the caller always knows which table it is filling.
 pub fn of(kind: &str, object: &Object) -> Health {
+    of_resource(&ResourceKey::new("", kind), object)
+}
+
+/// The health of an object when its full catalogue identity is known.
+///
+/// This is the form tables and details use. The API group prevents a custom
+/// kind with an ordinary name such as `Application` from receiving another
+/// controller's semantics.
+pub fn of_resource(resource: &ResourceKey, object: &Object) -> Health {
     // A deletion in flight outranks every kind's own rule: an object being
     // torn down is not unhealthy, and reporting its half-gone state as an
     // error is how a viewer cries wolf during a rollout.
     if object.meta.is_terminating() {
         return Health::new(Level::Working, "Terminating");
     }
-    match kind {
+    if resource.group == "argoproj.io" && resource.kind == "Application" {
+        return application(object);
+    }
+    if resource.group == "argoproj.io" && resource.kind == "ApplicationSet" {
+        return application_set(object);
+    }
+    match resource.kind.as_str() {
         "Pod" => pod(object),
         "Node" => node(object),
         "Deployment" | "StatefulSet" | "ReplicaSet" | "ReplicationController" => {
@@ -366,6 +381,74 @@ fn event(object: &Object) -> Health {
         "Warning" => Health::new(Level::Attention, "Warning"),
         "" => Health::new(Level::Ok, "Normal"),
         other => Health::new(Level::Ok, other),
+    }
+}
+
+/// An Argo CD Application's reconciliation state.
+///
+/// Argo CD does not expose a conventional `Ready` condition. Its own health,
+/// sync and operation words are the authoritative state, so the generic CRD
+/// fallback would otherwise leave every Application grey.
+fn application(object: &Object) -> Health {
+    let operation = object.str_at("status.operationState.phase");
+    match operation {
+        "Running" | "Terminating" => return Health::new(Level::Working, operation),
+        "Error" | "Failed" => return Health::new(Level::Error, operation),
+        _ => {}
+    }
+
+    let health = object.str_at("status.health.status");
+    match health {
+        "Degraded" | "Missing" => return Health::new(Level::Error, health),
+        "Progressing" => return Health::new(Level::Working, health),
+        "Suspended" => return Health::new(Level::Attention, health),
+        _ => {}
+    }
+
+    let sync = object.str_at("status.sync.status");
+    match (sync, health) {
+        ("Synced", "Healthy") => Health::new(Level::Ok, "Synced"),
+        ("OutOfSync", _) => Health::new(Level::Attention, "OutOfSync"),
+        (_, "Healthy") => Health::new(Level::Ok, "Healthy"),
+        (_, "Unknown") => Health::new(Level::Unknown, "Unknown"),
+        ("", "") => Health::unknown(),
+        (_, other) if !other.is_empty() => Health::new(Level::Unknown, other),
+        (other, _) => Health::new(Level::Unknown, other),
+    }
+}
+
+/// An Argo CD ApplicationSet's generated-Application health.
+///
+/// Newer controllers persist the calculated health directly. Older ones
+/// expose only conditions, for which this follows Argo's own priority:
+/// errors, stale resources, a progressing rollout, then up-to-date resources.
+fn application_set(object: &Object) -> Health {
+    let health = object.str_at("status.health.status");
+    if !health.is_empty() {
+        return match health {
+            "Healthy" => Health::new(Level::Ok, health),
+            "Degraded" | "Missing" => Health::new(Level::Error, health),
+            "Progressing" => Health::new(Level::Working, health),
+            "Suspended" => Health::new(Level::Attention, health),
+            other => Health::new(Level::Unknown, other),
+        };
+    }
+
+    let conditions = object.array_at("status.conditions");
+    let condition_is = |kind: &str, status: &str| {
+        conditions.iter().any(|condition| {
+            condition.get("type").and_then(Value::as_str) == Some(kind)
+                && condition.get("status").and_then(Value::as_str) == Some(status)
+        })
+    };
+    if condition_is("ErrorOccurred", "True") || condition_is("ResourcesUpToDate", "False") {
+        Health::new(Level::Error, "Degraded")
+    } else if condition_is("RolloutProgressing", "True") {
+        Health::new(Level::Working, "Progressing")
+    } else if condition_is("ResourcesUpToDate", "True") {
+        Health::new(Level::Ok, "Healthy")
+    } else {
+        Health::new(Level::Working, "Progressing")
     }
 }
 
@@ -663,6 +746,83 @@ mod tests {
             Health::new(Level::Attention, "Suspended")
         );
         assert_eq!(health("CronJob", json!({"spec": {}})).level, Level::Ok);
+    }
+
+    #[test]
+    fn an_argo_application_combines_operation_health_and_sync() {
+        let argo_health = |value| {
+            of_resource(
+                &ResourceKey::new("argoproj.io", "Application"),
+                &object(value),
+            )
+        };
+        assert_eq!(
+            argo_health(json!({"status": {"sync": {"status": "Synced"},
+                                           "health": {"status": "Healthy"}}})),
+            Health::new(Level::Ok, "Synced")
+        );
+        assert_eq!(
+            argo_health(json!({"status": {"sync": {"status": "OutOfSync"},
+                                           "health": {"status": "Healthy"}}})),
+            Health::new(Level::Attention, "OutOfSync")
+        );
+        assert_eq!(
+            argo_health(json!({"status": {"sync": {"status": "Synced"},
+                                           "health": {"status": "Degraded"}}})),
+            Health::new(Level::Error, "Degraded")
+        );
+        assert_eq!(
+            argo_health(json!({"status": {"operationState": {"phase": "Running"},
+                                           "sync": {"status": "OutOfSync"}}})),
+            Health::new(Level::Working, "Running")
+        );
+        assert_eq!(
+            of_resource(
+                &ResourceKey::new("example.com", "Application"),
+                &object(json!({"status": {"sync": {"status": "OutOfSync"}}})),
+            ),
+            Health::unknown()
+        );
+    }
+
+    #[test]
+    fn an_argo_application_set_uses_argos_condition_priority() {
+        let appset_health = |value| {
+            of_resource(
+                &ResourceKey::new("argoproj.io", "ApplicationSet"),
+                &object(value),
+            )
+        };
+        assert_eq!(
+            appset_health(json!({"status": {"health": {"status": "Healthy"}}})),
+            Health::new(Level::Ok, "Healthy")
+        );
+        assert_eq!(
+            appset_health(json!({"status": {"conditions": [
+                {"type": "ResourcesUpToDate", "status": "True"},
+                {"type": "ErrorOccurred", "status": "True"}
+            ]}})),
+            Health::new(Level::Error, "Degraded")
+        );
+        assert_eq!(
+            appset_health(json!({"status": {"conditions": [
+                {"type": "ResourcesUpToDate", "status": "False"}
+            ]}})),
+            Health::new(Level::Error, "Degraded")
+        );
+        assert_eq!(
+            appset_health(json!({"status": {"conditions": [
+                {"type": "RolloutProgressing", "status": "True"},
+                {"type": "ResourcesUpToDate", "status": "True"}
+            ]}})),
+            Health::new(Level::Working, "Progressing")
+        );
+        assert_eq!(
+            appset_health(json!({"status": {"conditions": [
+                {"type": "ResourcesUpToDate", "status": "True"}
+            ]}})),
+            Health::new(Level::Ok, "Healthy")
+        );
     }
 
     #[test]

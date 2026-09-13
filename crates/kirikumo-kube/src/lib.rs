@@ -6,7 +6,8 @@
 //! kinds declare ([`crd`], evaluated by [`jsonpath`]), the generic object
 //! model ([`model`]), the rule that turns an object into a health mark
 //! ([`health`]), quantity parsing ([`quantity`]), the [`Cluster`] trait every
-//! view reaches a cluster through, its REST implementation ([`rest`]), the
+//! view reaches a cluster through, including the API-group-aware identity an
+//! optional GitOps presentation uses, its REST implementation ([`rest`]), the
 //! framing of a watch ([`watch`]), the few writes and what each becomes on
 //! the wire ([`actions`], [`drain`]), a port forwarded to a pod and a command
 //! run in one ([`portforward`], [`exec`], over [`tls`]), and a scripted fake

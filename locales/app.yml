@@ -36,6 +36,9 @@ group.storage:
 group.access_control:
   en: Access Control
   ja: アクセス制御
+group.gitops:
+  en: GitOps
+  ja: GitOps
 group.custom:
   en: Custom Resources
   ja: カスタムリソース
@@ -113,6 +116,9 @@ detail.empty:
 detail.overview:
   en: Overview
   ja: 概要
+detail.resources:
+  en: Resources
+  ja: リソース
 detail.events:
   en: Events
   ja: イベント
@@ -167,6 +173,9 @@ detail.conditions:
 detail.events_empty:
   en: No events
   ja: イベントはありません
+detail.resources_empty:
+  en: Argo CD has not reported any managed resources.
+  ja: Argo CD から管理対象リソースがまだ報告されていません。
 detail.logs_empty:
   en: This container has said nothing
   ja: このコンテナの出力はありません
@@ -207,6 +216,9 @@ detail.container:
 # The writes. Each is reached from the object it acts on and confirmed by a
 # second button that names it (AGENTS.md rule 9); nothing here is bound to a
 # key or offered by the palette.
+action.sync:
+  en: Sync
+  ja: 同期
 action.scale:
   en: Scale
   ja: スケール
@@ -243,6 +255,9 @@ action.forbidden:
 action.replicas:
   en: Replicas
   ja: レプリカ数
+action.confirm.sync:
+  en: "Sync %{name}"
+  ja: "%{name} を同期"
 action.confirm.scale:
   en: "Scale %{name} to %{replicas}"
   ja: "%{name} を %{replicas} にスケール"

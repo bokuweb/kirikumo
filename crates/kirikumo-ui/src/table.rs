@@ -14,7 +14,7 @@
 
 use chrono::{DateTime, Utc};
 use kirikumo_kube::{
-    ApiResource, Health, Level, Object, PrinterColumn, health, jsonpath, quantity,
+    ApiResource, Health, Level, Object, PrinterColumn, ResourceKey, health, jsonpath, quantity,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -138,6 +138,8 @@ enum Cell {
 /// The columns for one kind, and what fills them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnSet {
+    /// The API group, empty for core resources or a kind-only set.
+    group: String,
     kind: String,
     columns: Vec<(Column, Cell)>,
     /// Which column the table sorts by when nothing has been clicked.
@@ -303,6 +305,7 @@ impl ColumnSet {
         columns.push((Column::fixed("AGE", 74.), Cell::Age));
         let age = columns.len() - 1;
         Self {
+            group: String::new(),
             kind: kind.to_string(),
             columns,
             default_sort: if sort_by_age { age } else { 0 },
@@ -327,6 +330,7 @@ impl ColumnSet {
         printer: Option<&[PrinterColumn]>,
     ) -> Self {
         let mut set = Self::for_kind(&resource.kind, resource.namespaced, show_namespace);
+        set.group.clone_from(&resource.group);
         let Some(printer) = printer.filter(|columns| !columns.is_empty()) else {
             return set;
         };
@@ -417,7 +421,7 @@ impl ColumnSet {
             key: row_key(object),
             name: object.meta.name.clone(),
             namespace: object.meta.namespace.clone(),
-            health: health::of(&self.kind, object),
+            health: health::of_resource(&ResourceKey::new(&self.group, &self.kind), object),
             created: object.meta.created,
             cells,
             haystack: haystack.to_lowercase(),
@@ -1220,6 +1224,27 @@ mod tests {
         );
         // A numeric printer column is drawn as a number.
         assert!(columns.columns().nth(2).unwrap().numeric);
+    }
+
+    #[test]
+    fn an_argo_application_row_uses_its_api_group_for_health() {
+        let resource = ApiResource {
+            group: "argoproj.io".into(),
+            version: "v1alpha1".into(),
+            kind: "Application".into(),
+            name: "applications".into(),
+            ..widgets()
+        };
+        let columns = ColumnSet::for_resource(&resource, false, None);
+        let application = object(json!({
+            "metadata": {"name": "shop"},
+            "status": {"sync": {"status": "OutOfSync"},
+                       "health": {"status": "Healthy"}}
+        }));
+        assert_eq!(
+            columns.row(&application, now()).health,
+            Health::new(Level::Attention, "OutOfSync")
+        );
     }
 
     #[test]

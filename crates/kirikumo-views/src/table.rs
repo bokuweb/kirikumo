@@ -271,7 +271,7 @@ impl ResourceTable {
             .flex_shrink_0()
             .px_2()
             .items_center()
-            .bg(tokens.colors().table_head())
+            .bg(tokens.table_head())
             .border_b_1()
             .border_color(tokens.colors().border_subtle)
             // The mark's column has no heading: the mark is the row's state

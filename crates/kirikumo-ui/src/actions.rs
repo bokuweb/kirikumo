@@ -93,6 +93,7 @@ pub fn parse_replicas(text: &str) -> Option<u32> {
 /// so the second gesture cannot be made without reading what it is for.
 pub fn confirm_label(action: Action, name: &str, replicas: Option<u32>) -> String {
     match action {
+        Action::Sync => rust_i18n::t!("action.confirm.sync", name = name).to_string(),
         Action::Scale => rust_i18n::t!(
             "action.confirm.scale",
             name = name,
@@ -163,6 +164,7 @@ mod tests {
     #[test]
     fn everything_else_can_be_confirmed_the_moment_it_is_armed() {
         for action in [
+            Action::Sync,
             Action::Delete,
             Action::Restart,
             Action::Cordon,

@@ -65,13 +65,13 @@ fn source(settings: &AppSettings) -> (Arc<dyn Cluster>, Option<KubeConfig>) {
 
 /// `KIRIKUMO_DEMO_OPEN=Pod/shop/api-7d9f8c-2xk4t`: an object to open as soon
 /// as the window is up, as `Kind/namespace/name` with the namespace left
-/// empty for a cluster-scoped kind, and a trailing `#events`, `#yaml` or
-/// `#logs` to open it on that tab. For screenshots — and it goes through the
-/// same path a link in the detail panel does, so it exercises what a reader
-/// would.
+/// empty for a cluster-scoped kind, and a trailing tab fragment such as
+/// `#resources`, `#events`, `#yaml` or `#logs`. For screenshots — and it goes
+/// through the same path a link in the detail panel does, so it exercises
+/// what a reader would.
 fn open_at_launch() -> Option<(Target, Option<String>)> {
     let value = std::env::var("KIRIKUMO_DEMO_OPEN").ok()?;
-    // A trailing `#events`, `#yaml` or `#logs` opens it on that tab.
+    // A trailing fragment opens the matching detail tab.
     let (value, tab) = match value.split_once('#') {
         Some((value, tab)) => (value.to_string(), Some(tab.to_string())),
         None => (value, None),

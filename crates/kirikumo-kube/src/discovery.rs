@@ -116,18 +116,24 @@ pub fn preferred_group_versions(apis: &Value) -> Vec<String> {
 /// 1. Only listable kinds get in — a subresource (`pods/log`, `nodes/status`)
 ///    is not a thing to put in a sidebar.
 /// 2. One entry per [`ResourceKey`]: a kind served at two versions appears
-///    once, at the version discovery said the group prefers. Discovery
-///    already asks only for the preferred version of each group, so a
-///    duplicate here means two *groups* claim the same kind, and the first
-///    wins, which puts the built-in ahead of an aggregated copy.
-/// 3. The order is the sidebar's: by group, then by the position of the kind
+///    once, at the version discovery said the group prefers.
+/// 3. Core `Event` wins over its `events.k8s.io` projection. Kubernetes serves
+///    both APIs for the same records; presenting both would be two identical
+///    sidebar rows rather than two resources.
+/// 4. The order is the sidebar's: by group, then by the position of the kind
 ///    in [`ORDER`], then alphabetically for everything that list does not
 ///    name.
 pub fn catalogue(lists: Vec<Vec<ApiResource>>) -> Catalogue {
+    let has_core_events = lists.iter().flatten().any(|resource| {
+        resource.group.is_empty() && resource.kind == "Event" && resource.is_listable()
+    });
     let mut seen: BTreeMap<ResourceKey, ApiResource> = BTreeMap::new();
     for list in lists {
         for resource in list {
             if !resource.is_listable() {
+                continue;
+            }
+            if has_core_events && resource.group == "events.k8s.io" && resource.kind == "Event" {
                 continue;
             }
             seen.entry(resource.key()).or_insert(resource);
@@ -215,6 +221,11 @@ const ORDER: &[(&str, &str, Group)] = &[
         "ClusterRoleBinding",
         Group::AccessControl,
     ),
+    // GitOps. These are Argo CD's API, not Argo Rollouts: both use the
+    // argoproj.io group, so the kind is part of the distinction.
+    ("argoproj.io", "Application", Group::GitOps),
+    ("argoproj.io", "ApplicationSet", Group::GitOps),
+    ("argoproj.io", "AppProject", Group::GitOps),
 ];
 
 /// Which sidebar group a kind belongs to.
@@ -358,6 +369,31 @@ mod tests {
     }
 
     #[test]
+    fn the_two_kubernetes_event_apis_are_one_sidebar_resource() {
+        let catalogue = catalogue(vec![
+            vec![resource(
+                "events.k8s.io",
+                "v1",
+                "Event",
+                "events",
+                &["list", "watch"],
+            )],
+            vec![resource("", "v1", "Event", "events", &["list", "watch"])],
+        ]);
+
+        assert_eq!(
+            catalogue
+                .resources
+                .iter()
+                .filter(|resource| resource.kind == "Event")
+                .count(),
+            1
+        );
+        assert!(catalogue.has(&ResourceKey::new("", "Event")));
+        assert!(!catalogue.has(&ResourceKey::new("events.k8s.io", "Event")));
+    }
+
+    #[test]
     fn the_sidebar_order_is_the_one_people_already_know() {
         let catalogue = catalogue(vec![vec![
             resource("apps", "v1", "Deployment", "deployments", &["list"]),
@@ -384,6 +420,20 @@ mod tests {
         let catalogue = catalogue(vec![vec![rollout]]);
         assert_eq!(catalogue.in_group(Group::Custom).len(), 1);
         assert!(catalogue.in_group(Group::Workloads).is_empty());
+    }
+
+    #[test]
+    fn argo_cd_has_a_gitops_group_without_swallowing_argo_rollouts() {
+        let application = resource(
+            "argoproj.io",
+            "v1alpha1",
+            "Application",
+            "applications",
+            &["list"],
+        );
+        let rollout = resource("argoproj.io", "v1alpha1", "Rollout", "rollouts", &["list"]);
+        assert_eq!(group_of(&application), Group::GitOps);
+        assert_eq!(group_of(&rollout), Group::Custom);
     }
 
     #[test]

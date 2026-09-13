@@ -510,6 +510,8 @@ pub enum Group {
     Storage,
     /// Service accounts, roles, bindings.
     AccessControl,
+    /// Argo CD applications, application sets and projects.
+    GitOps,
     /// Everything else, under its API group.
     Custom,
 }
@@ -523,6 +525,7 @@ impl Group {
         Group::Network,
         Group::Storage,
         Group::AccessControl,
+        Group::GitOps,
         Group::Custom,
     ];
 
@@ -535,6 +538,7 @@ impl Group {
             Self::Network => "group.network",
             Self::Storage => "group.storage",
             Self::AccessControl => "group.access_control",
+            Self::GitOps => "group.gitops",
             Self::Custom => "group.custom",
         }
     }
