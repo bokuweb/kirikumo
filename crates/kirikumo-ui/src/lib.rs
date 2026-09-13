@@ -8,7 +8,8 @@
 //!
 //! The three modules worth reading first are [`nav`], which turns the
 //! cluster's catalogue into the sidebar's tree; [`table`], which turns an
-//! object into a row; and [`detail`], which turns one into the right panel.
+//! object into a row; [`detail`], which turns one into the right panel; and
+//! [`gitops`], which reads Argo CD's native Application status.
 //! All three are functions of the object's JSON, which is what lets a custom
 //! resource render with no code written for it (rule 8).
 
@@ -22,6 +23,7 @@ pub mod assets;
 pub mod detail;
 pub mod fetch;
 pub mod filter;
+pub mod gitops;
 pub mod i18n;
 pub mod layout;
 pub mod logging;

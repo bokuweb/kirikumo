@@ -578,6 +578,14 @@ impl Store {
         if uid.is_empty() || self.events.get(&uid).is_some_and(|fetch| !fetch.is_idle()) {
             return;
         }
+        self.load_events(uid, namespace, cx);
+    }
+
+    /// Fetch an object's events again, including after an empty result.
+    pub fn load_events(&mut self, uid: String, namespace: Option<String>, cx: &mut Context<Self>) {
+        if uid.is_empty() {
+            return;
+        }
         self.events.entry(uid.clone()).or_default().begin();
         let key = uid.clone();
         self.fetch(

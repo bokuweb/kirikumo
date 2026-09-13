@@ -156,6 +156,7 @@ pub fn group_icon(group: Group) -> &'static str {
         Group::Network => icon::NETWORK,
         Group::Storage => icon::DISK,
         Group::AccessControl => icon::USER,
+        Group::GitOps => icon::FRAME,
         Group::Custom => icon::FRAME,
     }
 }
@@ -172,6 +173,7 @@ pub fn group_id(group: Group) -> &'static str {
         Group::Network => "network",
         Group::Storage => "storage",
         Group::AccessControl => "access-control",
+        Group::GitOps => "gitops",
         Group::Custom => "custom",
     }
 }
@@ -288,6 +290,26 @@ mod tests {
         assert_eq!(headings, vec![Some("argoproj.io"), Some("cert-manager.io")]);
         assert_eq!(custom.subsections[0].rows.len(), 2);
         assert_eq!(custom.subsections[0].rows[0].title, "AnalysisRuns");
+    }
+
+    #[test]
+    fn argo_cd_is_its_own_optional_group_and_rollouts_stay_custom() {
+        let sections = sections(&catalogue(vec![
+            resource("argoproj.io", "Application", "applications"),
+            resource("argoproj.io", "ApplicationSet", "applicationsets"),
+            resource("argoproj.io", "Rollout", "rollouts"),
+        ]));
+        let gitops = sections
+            .iter()
+            .find(|section| section.group == Group::GitOps)
+            .unwrap();
+        assert_eq!(gitops.len(), 2);
+        let custom = sections
+            .iter()
+            .find(|section| section.group == Group::Custom)
+            .unwrap();
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom.subsections[0].rows[0].title, "Rollouts");
     }
 
     #[test]

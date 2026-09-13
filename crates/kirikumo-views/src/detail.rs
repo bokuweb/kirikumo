@@ -1,7 +1,7 @@
 //! The right panel: `docs/ui.md` §3.4.
 //!
-//! Six tabs over one object — Overview, Events, YAML, and for anything with
-//! containers Logs, Run and Shell. What each of them says is decided in
+//! Tabs over one object — Overview, Events, YAML, an Argo CD Application's
+//! Resources, and for anything with containers Logs, Run and Shell. What each of them says is decided in
 //! `kirikumo_ui` (`detail::overview`, `terminal::Screen`) or in
 //! `kirikumo_kube` (`yaml::to_yaml`); this file draws it.
 //!
@@ -38,6 +38,8 @@ const SHELL_DEFAULT: (u16, u16) = (80, 24);
 pub enum Tab {
     /// The facts.
     Overview,
+    /// Resources managed by an Argo CD Application.
+    Resources,
     /// What has happened to it.
     Events,
     /// The object as the apiserver holds it.
@@ -55,6 +57,7 @@ impl Tab {
     fn label_key(self) -> &'static str {
         match self {
             Self::Overview => "detail.overview",
+            Self::Resources => "detail.resources",
             Self::Events => "detail.events",
             Self::Yaml => "detail.yaml",
             Self::Logs => "detail.logs",
@@ -208,6 +211,12 @@ impl Detail {
             self.container = None;
             self.store.update(cx, |store, _| store.detach_shell());
         }
+        if self.tab == Tab::Resources && !is_argo_application(&key.0) {
+            self.tab = Tab::Overview;
+        }
+        if self.tab == Tab::Events && !detail::has_related_events(&key.0) {
+            self.tab = Tab::Overview;
+        }
         self.key = Some(key);
         // A write armed on one object must not fire on the next.
         self.pending = Pending::Idle;
@@ -241,6 +250,14 @@ impl Detail {
             self.reload_log(cx);
             return;
         }
+        if self.tab == Tab::Events {
+            if let Some(object) = self.object(cx) {
+                self.store.update(cx, |store, cx| {
+                    store.load_events(object.meta.uid, object.meta.namespace, cx)
+                });
+            }
+            return;
+        }
         self.ensure(cx);
     }
 
@@ -263,14 +280,31 @@ impl Detail {
     /// Open a tab by name. For demos and screenshots
     /// (`KIRIKUMO_DEMO_OPEN=…#yaml`); an unknown name is the Overview.
     pub fn show_tab_named(&mut self, name: &str, cx: &mut Context<Self>) {
-        let tab = match name {
+        let mut tab = match name {
             "events" => Tab::Events,
+            "resources" => Tab::Resources,
             "yaml" => Tab::Yaml,
             "logs" => Tab::Logs,
             "run" => Tab::Run,
             "shell" => Tab::Shell,
             _ => Tab::Overview,
         };
+        if tab == Tab::Resources
+            && !self
+                .key
+                .as_ref()
+                .is_some_and(|(resource, _, _)| is_argo_application(resource))
+        {
+            tab = Tab::Overview;
+        }
+        if tab == Tab::Events
+            && !self
+                .key
+                .as_ref()
+                .is_some_and(|(resource, _, _)| detail::has_related_events(resource))
+        {
+            tab = Tab::Overview;
+        }
         self.attach_when_allowed = tab == Tab::Shell;
         self.set_tab(tab, cx);
     }
@@ -355,7 +389,7 @@ impl Detail {
                     self.attach_shell(cx);
                 }
             }
-            Tab::Overview | Tab::Yaml => {}
+            Tab::Overview | Tab::Resources | Tab::Yaml => {}
         }
     }
 
@@ -407,7 +441,10 @@ impl Detail {
     fn header(&self, object: &Object, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let tokens = Tokens::global(cx).clone();
         let kind = self.kind();
-        let health = kirikumo_kube::health::of(&kind, object);
+        let health = match self.key.as_ref() {
+            Some((resource, _, _)) => kirikumo_kube::health::of_resource(resource, object),
+            None => kirikumo_kube::health::of(&kind, object),
+        };
         let mut where_it_is = kind.clone();
         if let Some(namespace) = &object.meta.namespace {
             where_it_is.push_str(" · ");
@@ -465,17 +502,25 @@ impl Detail {
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let tokens = Tokens::global(cx).clone();
         let has_containers = !self.containers(cx).is_empty();
-        let tabs: Vec<Tab> = match has_containers {
-            true => vec![
-                Tab::Overview,
-                Tab::Events,
-                Tab::Yaml,
-                Tab::Logs,
-                Tab::Run,
-                Tab::Shell,
-            ],
-            false => vec![Tab::Overview, Tab::Events, Tab::Yaml],
-        };
+        let mut tabs = vec![Tab::Overview];
+        if self
+            .key
+            .as_ref()
+            .is_some_and(|(resource, _, _)| is_argo_application(resource))
+        {
+            tabs.push(Tab::Resources);
+        }
+        if self
+            .key
+            .as_ref()
+            .is_some_and(|(resource, _, _)| detail::has_related_events(resource))
+        {
+            tabs.push(Tab::Events);
+        }
+        tabs.push(Tab::Yaml);
+        if has_containers {
+            tabs.extend([Tab::Logs, Tab::Run, Tab::Shell]);
+        }
         h_flex()
             .w_full()
             .px_3()
@@ -512,7 +557,12 @@ impl Detail {
             .read(cx)
             .metrics_for(&kind, object.meta.namespace.as_deref(), &object.meta.name)
             .cloned();
-        let overview = detail::overview(&kind, object, usage.as_ref(), Utc::now());
+        let overview = match self.key.as_ref() {
+            Some((resource, _, _)) => {
+                detail::overview_for(resource, object, usage.as_ref(), Utc::now())
+            }
+            None => detail::overview(&kind, object, usage.as_ref(), Utc::now()),
+        };
 
         v_flex()
             .id("overview")
@@ -621,6 +671,143 @@ impl Detail {
                         })),
                 )
             })
+            .into_any_element()
+    }
+
+    /// The resources Argo CD reports for the Application.
+    ///
+    /// This is deliberately a flat, virtualized list. The Application CR has
+    /// a flat `status.resources`; inventing ownership edges would be less
+    /// honest than the data, and drawing one element per resource would fail
+    /// on the applications for which this view matters most.
+    fn resources(&self, object: &Object, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = Tokens::global(cx).clone();
+        let application = kirikumo_ui::gitops::Application::from_object(object);
+        let resources = {
+            let store = self.store.read(cx);
+            let current_server = store.current_server();
+            application
+                .resources_for_display()
+                .into_iter()
+                .map(|resource| {
+                    let namespaced = store
+                        .resource(&resource.key())
+                        .map(|served| served.namespaced);
+                    let target = resource.target(&application, current_server, namespaced);
+                    (resource, target)
+                })
+                .collect::<Vec<_>>()
+        };
+        if resources.is_empty() {
+            return self.notice(
+                rust_i18n::t!("detail.resources_empty").to_string(),
+                false,
+                cx,
+            );
+        }
+        let count = resources.len();
+        let row_tokens = tokens.clone();
+        let this = cx.entity();
+        let rows = uniform_list("gitops-resources", count, move |range, _window, cx| {
+            this.update(cx, |_this, cx| {
+                range
+                    .map(|index| {
+                        let (resource, target) = &resources[index];
+                        let target = target.clone();
+                        let level = resource.level();
+                        let qualified = resource.key().qualified();
+                        let place = match resource.namespace.as_deref() {
+                            Some(namespace) => format!("{qualified} · {namespace}"),
+                            None => qualified,
+                        };
+                        h_flex()
+                            .id(("gitops-resource", index))
+                            .h(px(36.))
+                            .w_full()
+                            .px_3()
+                            .gap_2()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(row_tokens.colors().border_subtle)
+                            .when(target.is_some(), |this| {
+                                this.cursor_pointer()
+                                    .hover(|this| this.bg(row_tokens.colors().row_hover()))
+                            })
+                            .child(
+                                Icon::empty()
+                                    .path(icon::health(level))
+                                    .size(px(8.))
+                                    .text_color(row_tokens.colors().health(level)),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .font_family("monospace")
+                                            .text_color(row_tokens.colors().text_primary)
+                                            .truncate()
+                                            .child(resource.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(row_tokens.colors().text_muted)
+                                            .truncate()
+                                            .child(place),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(70.))
+                                    .flex_shrink_0()
+                                    .text_size(px(10.5))
+                                    .text_color(row_tokens.colors().text_secondary)
+                                    .truncate()
+                                    .child(resource.sync.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(70.))
+                                    .flex_shrink_0()
+                                    .text_size(px(10.5))
+                                    .text_color(row_tokens.colors().health(level))
+                                    .truncate()
+                                    .child(resource.health.clone()),
+                            )
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if let Some(target) = target.clone() {
+                                    cx.emit(DetailEvent::Navigate(target));
+                                }
+                            }))
+                    })
+                    .collect()
+            })
+        })
+        .flex_1()
+        .w_full();
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .h(px(26.))
+                    .w_full()
+                    .px_3()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(tokens.colors().border_strong)
+                    .text_size(px(10.))
+                    .text_color(tokens.colors().text_muted)
+                    .child(div().w(px(8.)))
+                    .child(div().flex_1().child("NAME · KIND · NAMESPACE"))
+                    .child(div().w(px(70.)).child("SYNC"))
+                    .child(div().w(px(70.)).child("HEALTH")),
+            )
+            .child(rows)
             .into_any_element()
     }
 
@@ -991,6 +1178,7 @@ impl Detail {
         };
         let write = match action {
             Action::Delete => Write::Delete,
+            Action::Sync => Write::Patch(actions::sync()),
             Action::Scale => match self.pending.replicas() {
                 Some(count) => Write::Patch(actions::scale(count)),
                 None => return,
@@ -1121,6 +1309,7 @@ impl Detail {
                     let allowed = self.permission(action, cx) == Some(true);
                     self.button(
                         match action {
+                            Action::Sync => "act-sync",
                             Action::Scale => "act-scale",
                             Action::Restart => "act-restart",
                             Action::Cordon => "act-cordon",
@@ -1946,6 +2135,7 @@ impl Render for Detail {
         let tabs = self.tabs(cx).into_any_element();
         let body = match self.tab {
             Tab::Overview => self.overview(&object, cx),
+            Tab::Resources => self.resources(&object, cx),
             Tab::Events => self.events(&object, cx),
             Tab::Yaml => self.yaml(&object, window, cx),
             Tab::Logs => self.logs(cx),
@@ -1960,6 +2150,11 @@ impl Render for Detail {
             .child(div().flex_1().min_h_0().w_full().child(body))
             .children(footer)
     }
+}
+
+/// Whether this catalogue identity is the Argo CD Application kind.
+fn is_argo_application(resource: &kirikumo_kube::ResourceKey) -> bool {
+    resource.group == kirikumo_ui::gitops::ARGO_CD_GROUP && resource.kind == "Application"
 }
 
 /// How one span of the shell's screen is drawn.

@@ -237,8 +237,11 @@ impl Sidebar {
             .collect();
 
         v_flex()
-            .w_full()
-            .mt_1()
+            .absolute()
+            .top(px(52.))
+            .left(px(8.))
+            .right(px(8.))
+            .max_h(px(360.))
             .p_1()
             .gap_0p5()
             .rounded(px(tokens.radius.panel))
@@ -251,64 +254,68 @@ impl Sidebar {
                     .pb_1()
                     .child(Input::new(&self.filter).cleanable(true)),
             )
-            .when(matching.is_empty(), |this| {
-                this.child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(11.5))
-                        .text_color(tokens.colors().text_muted)
-                        .child(rust_i18n::t!("context.empty").to_string()),
-                )
-            })
-            .children(
-                matching
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (name, server, selected))| {
-                        let picked = name.clone();
-                        h_flex()
-                            .id(("context", index))
-                            .w_full()
-                            .px_2()
-                            .py_1()
-                            .gap_2()
-                            .items_center()
-                            .rounded(px(tokens.radius.row))
-                            .cursor_pointer()
-                            .when(selected, |this| this.bg(tokens.colors().row_active()))
-                            .hover(|this| this.bg(tokens.colors().row_hover()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.pick_context(picked.clone(), cx)
-                            }))
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .child(
-                                        div()
-                                            .text_size(px(13.))
-                                            .text_color(tokens.colors().text_primary)
-                                            .truncate()
-                                            .child(name),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(tokens.colors().text_muted)
-                                            .truncate()
-                                            .child(server),
-                                    ),
-                            )
-                            .when(selected, |this| {
-                                this.child(
-                                    Icon::empty()
-                                        .path(icon::CHECK)
-                                        .size_3()
-                                        .text_color(tokens.colors().accent),
+            .child(
+                v_flex()
+                    .id("contexts")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(matching.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_size(px(11.5))
+                                .text_color(tokens.colors().text_muted)
+                                .child(rust_i18n::t!("context.empty").to_string()),
+                        )
+                    })
+                    .children(matching.into_iter().enumerate().map(
+                        |(index, (name, server, selected))| {
+                            let picked = name.clone();
+                            h_flex()
+                                .id(("context", index))
+                                .w_full()
+                                .px_2()
+                                .py_1()
+                                .gap_2()
+                                .items_center()
+                                .rounded(px(tokens.radius.row))
+                                .cursor_pointer()
+                                .when(selected, |this| this.bg(tokens.colors().row_active()))
+                                .hover(|this| this.bg(tokens.colors().row_hover()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_context(picked.clone(), cx)
+                                }))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .text_color(tokens.colors().text_primary)
+                                                .truncate()
+                                                .child(name),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(tokens.colors().text_muted)
+                                                .truncate()
+                                                .child(server),
+                                        ),
                                 )
-                            })
-                    }),
+                                .when(selected, |this| {
+                                    this.child(
+                                        Icon::empty()
+                                            .path(icon::CHECK)
+                                            .size_3()
+                                            .text_color(tokens.colors().accent),
+                                    )
+                                })
+                        },
+                    )),
             )
     }
 
@@ -545,11 +552,11 @@ impl Render for Sidebar {
 
         v_flex()
             .size_full()
+            .relative()
             .bg(tokens.colors().bg_sidebar)
             .border_r_1()
             .border_color(tokens.colors().border_subtle)
             .child(div().px_2().pt_1().child(header))
-            .children(picker.map(|picker| div().px_2().child(picker)))
             .child(
                 v_flex()
                     .id("sidebar-scroll")
@@ -573,5 +580,6 @@ impl Render for Sidebar {
                     }),
             )
             .child(footer)
+            .children(picker)
     }
 }

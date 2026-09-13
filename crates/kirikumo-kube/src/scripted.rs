@@ -115,6 +115,21 @@ impl Scripted {
                 "persistentvolumeclaims",
                 true,
             ),
+            patchable(resource(
+                "argoproj.io",
+                "v1alpha1",
+                "Application",
+                "applications",
+                true,
+            )),
+            resource(
+                "argoproj.io",
+                "v1alpha1",
+                "ApplicationSet",
+                "applicationsets",
+                true,
+            ),
+            resource("argoproj.io", "v1alpha1", "AppProject", "appprojects", true),
             resource("argoproj.io", "v1alpha1", "Rollout", "rollouts", true),
             resource(
                 "apiextensions.k8s.io",
@@ -140,7 +155,7 @@ impl Scripted {
         objects.insert(
             ResourceKey::new("", "Namespace"),
             parse(
-                ["default", "kube-system", "observability", "shop"]
+                ["argocd", "default", "kube-system", "observability", "shop"]
                     .into_iter()
                     .map(|name| {
                         json!({
@@ -344,6 +359,114 @@ impl Scripted {
                 "spec": {"replicas": 2},
                 "status": {"readyReplicas": 1,
                            "conditions": [{"type": "Available", "status": "True"}]}
+            })]),
+        );
+
+        // An Argo CD Application whose managed-resource rows all point at
+        // objects elsewhere in this same sample. This exercises the native
+        // GitOps surface without introducing an Argo-specific fake client.
+        objects.insert(
+            ResourceKey::new("argoproj.io", "Application"),
+            parse(vec![json!({
+                "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+                "metadata": {"name": "shop", "namespace": "argocd", "uid": "app-shop",
+                             "creationTimestamp": ago(60 * 24 * 20),
+                             "ownerReferences": [{"apiVersion": "argoproj.io/v1alpha1",
+                                                  "kind": "ApplicationSet",
+                                                  "name": "environments", "uid": "appset-environments",
+                                                  "controller": true}]},
+                "spec": {
+                    "project": "production",
+                    "destination": {"server": "https://kubernetes.default.svc",
+                                    "namespace": "shop"},
+                    "source": {"repoURL": "https://github.com/acme/shop",
+                               "path": "deploy/production", "targetRevision": "main"},
+                    "syncPolicy": {"automated": {"prune": true, "selfHeal": true}}
+                },
+                "status": {
+                    "sync": {"status": "OutOfSync", "revision": "7e31c2a"},
+                    "health": {"status": "Degraded"},
+                    "operationState": {"phase": "Failed"},
+                    "resources": [
+                        {"group": "apps", "kind": "Deployment", "namespace": "shop",
+                         "name": "api", "status": "Synced",
+                         "health": {"status": "Healthy"}},
+                        {"group": "apps", "kind": "Deployment", "namespace": "shop",
+                         "name": "web", "status": "OutOfSync",
+                         "health": {"status": "Progressing"}},
+                        {"kind": "Service", "namespace": "shop", "name": "web",
+                         "status": "OutOfSync", "health": {"status": "Degraded"}},
+                        {"kind": "ConfigMap", "namespace": "shop", "name": "api-config",
+                         "status": "Synced", "health": {"status": "Healthy"}},
+                        {"kind": "Namespace", "name": "shop", "status": "Synced",
+                         "health": {"status": "Healthy"}}
+                    ]
+                }
+            })]),
+        );
+
+        objects.insert(
+            ResourceKey::new("argoproj.io", "ApplicationSet"),
+            parse(vec![json!({
+                "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+                "metadata": {"name": "environments", "namespace": "argocd",
+                             "uid": "appset-environments",
+                             "creationTimestamp": ago(60 * 24 * 30)},
+                "spec": {
+                    "goTemplate": true,
+                    "generators": [{"list": {"elements": [{"environment": "shop"}]}}],
+                    "template": {
+                        "metadata": {"name": "{{.environment}}"},
+                        "spec": {"project": "production",
+                                 "destination": {"server": "https://kubernetes.default.svc",
+                                                 "namespace": "{{.environment}}"}}
+                    },
+                    "strategy": {"type": "RollingSync"}
+                },
+                "status": {
+                    "resourcesCount": 1,
+                    "resources": [{"group": "argoproj.io", "kind": "Application",
+                                   "namespace": "argocd", "name": "shop"}],
+                    "health": {"status": "Progressing"},
+                    "conditions": [
+                        {"type": "RolloutProgressing", "status": "True",
+                         "reason": "ApplicationSetModified",
+                         "message": "Waiting for shop to become healthy"},
+                        {"type": "ResourcesUpToDate", "status": "True",
+                         "reason": "ApplicationSetUpToDate",
+                         "message": "All applications have been generated successfully"}
+                    ]
+                }
+            })]),
+        );
+
+        objects.insert(
+            ResourceKey::new("argoproj.io", "AppProject"),
+            parse(vec![json!({
+                "apiVersion": "argoproj.io/v1alpha1", "kind": "AppProject",
+                "metadata": {"name": "production", "namespace": "argocd",
+                             "uid": "project-production",
+                             "creationTimestamp": ago(60 * 24 * 60)},
+                "spec": {
+                    "description": "Production workloads",
+                    "sourceRepos": ["https://github.com/acme/*"],
+                    "sourceNamespaces": ["argocd"],
+                    "destinations": [{"server": "https://kubernetes.default.svc",
+                                      "namespace": "shop"}],
+                    "clusterResourceWhitelist": [{"group": "", "kind": "Namespace"}],
+                    "namespaceResourceWhitelist": [
+                        {"group": "apps", "kind": "Deployment"},
+                        {"group": "", "kind": "Service"},
+                        {"group": "", "kind": "ConfigMap"}
+                    ],
+                    "namespaceResourceBlacklist": [{"group": "", "kind": "Secret"}],
+                    "roles": [{"name": "read-only", "groups": ["engineering"]},
+                              {"name": "deploy", "groups": ["platform"]}],
+                    "orphanedResources": {"warn": true, "ignore": []},
+                    "permitOnlyProjectScopedClusters": true,
+                    "syncWindows": [{"kind": "deny", "schedule": "0 22 * * *",
+                                     "duration": "8h", "manualSync": true}]
+                }
             })]),
         );
 
@@ -701,9 +824,8 @@ impl Cluster for Scripted {
     }
 }
 
-/// A resource for the sample catalogue: everything a viewer may do, nothing
-/// it may not, because the scripted cluster refuses writes by inheriting the
-/// trait's defaults.
+/// A read-only resource for the sample catalogue. Individual fixtures opt in
+/// to the one additional verb their demo needs.
 fn resource(group: &str, version: &str, kind: &str, name: &str, namespaced: bool) -> ApiResource {
     ApiResource {
         group: group.into(),
@@ -716,6 +838,11 @@ fn resource(group: &str, version: &str, kind: &str, name: &str, namespaced: bool
         short_names: Vec::new(),
         categories: Vec::new(),
     }
+}
+
+fn patchable(mut resource: ApiResource) -> ApiResource {
+    resource.verbs.push("patch".into());
+    resource
 }
 
 fn parse(values: Vec<Value>) -> Vec<Object> {
@@ -1210,6 +1337,103 @@ mod tests {
         let rollouts = resource_for(&cluster, "argoproj.io", "Rollout");
         assert_eq!(discovery::group_of(&rollouts), crate::model::Group::Custom);
         assert_eq!(cluster.list(&rollouts, None).unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn the_sample_has_an_argo_application_whose_managed_resources_exist() {
+        let cluster = Scripted::sample();
+        let applications = resource_for(&cluster, "argoproj.io", "Application");
+        assert_eq!(
+            discovery::group_of(&applications),
+            crate::model::Group::GitOps
+        );
+        let application = cluster
+            .get(&applications, Some("argocd"), "shop")
+            .expect("the demo application exists");
+        assert_eq!(application.str_at("status.sync.status"), "OutOfSync");
+        assert_eq!(application.str_at("status.health.status"), "Degraded");
+
+        for managed in application.array_at("status.resources") {
+            let resource = resource_for(
+                &cluster,
+                managed
+                    .get("group")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                managed.get("kind").and_then(Value::as_str).unwrap(),
+            );
+            let namespace = managed.get("namespace").and_then(Value::as_str);
+            let name = managed.get("name").and_then(Value::as_str).unwrap();
+            cluster
+                .get(&resource, namespace, name)
+                .unwrap_or_else(|_| panic!("managed resource {name} exists in the sample"));
+        }
+    }
+
+    #[test]
+    fn the_sample_has_an_application_set_with_generation_state() {
+        let cluster = Scripted::sample();
+        let application_sets = resource_for(&cluster, "argoproj.io", "ApplicationSet");
+        assert_eq!(
+            discovery::group_of(&application_sets),
+            crate::model::Group::GitOps
+        );
+        let application_set = cluster
+            .get(&application_sets, Some("argocd"), "environments")
+            .expect("the demo application set exists");
+        assert_eq!(application_set.str_at("spec.strategy.type"), "RollingSync");
+        assert_eq!(
+            application_set
+                .at("status.resourcesCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            application_set.str_at("status.health.status"),
+            "Progressing"
+        );
+    }
+
+    #[test]
+    fn every_sample_application_references_an_existing_app_project() {
+        let cluster = Scripted::sample();
+        let applications = resource_for(&cluster, "argoproj.io", "Application");
+        let projects = resource_for(&cluster, "argoproj.io", "AppProject");
+        for application in cluster.list(&applications, None).unwrap().items {
+            let project = application.str_at("spec.project");
+            assert!(!project.is_empty());
+            cluster
+                .get(&projects, application.meta.namespace.as_deref(), project)
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "Application {} references existing AppProject {project}",
+                        application.meta.name
+                    )
+                });
+        }
+    }
+
+    #[test]
+    fn the_sample_application_accepts_the_same_sync_patch_as_a_cluster() {
+        let cluster = Scripted::sample();
+        let applications = resource_for(&cluster, "argoproj.io", "Application");
+        assert!(applications.supports("patch"));
+        let application = cluster.get(&applications, Some("argocd"), "shop").unwrap();
+        assert!(
+            crate::actions::available(&applications, &application)
+                .contains(&crate::actions::Action::Sync)
+        );
+
+        let synced = cluster
+            .patch(
+                &applications,
+                Some("argocd"),
+                "shop",
+                crate::actions::sync(),
+            )
+            .unwrap();
+        assert_eq!(synced.at("operation.sync"), Some(&json!({})));
+        assert_eq!(synced.str_at("operation.initiatedBy.username"), "kirikumo");
     }
 
     #[test]

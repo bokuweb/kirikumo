@@ -1,6 +1,6 @@
 //! What can be done to an object, and what each thing becomes on the wire.
 //!
-//! The viewer's few writes (`docs/roadmap.md` M4): delete, scale, restart,
+//! The viewer's few writes (`docs/roadmap.md` M4): sync, delete, scale, restart,
 //! cordon and uncordon, and applying an edited manifest. Each is decided here
 //! — which kinds offer it, which RBAC verb it needs, what patch it is — so
 //! the rules can be tested without a window or a cluster, and so the view
@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 /// A write the viewer offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
+    /// Ask an Argo CD Application to reconcile its configured revision.
+    Sync,
     /// Change how many replicas a controller wants.
     Scale,
     /// Roll every pod of a controller, the way `kubectl rollout restart` does.
@@ -39,6 +41,7 @@ impl Action {
     /// Every action, in the order a strip of buttons lists them: the mild
     /// ones first, and delete last where a hand does not fall on it.
     pub const ALL: &'static [Action] = &[
+        Action::Sync,
         Action::Scale,
         Action::Restart,
         Action::Cordon,
@@ -55,7 +58,12 @@ impl Action {
             // A drain is a cordon and then evictions; the cordon is what
             // can be asked about up front. Whether each eviction is allowed
             // is answered by the apiserver, per pod, in the report.
-            Self::Scale | Self::Restart | Self::Cordon | Self::Uncordon | Self::Drain => "patch",
+            Self::Sync
+            | Self::Scale
+            | Self::Restart
+            | Self::Cordon
+            | Self::Uncordon
+            | Self::Drain => "patch",
             Self::Apply => "update",
         }
     }
@@ -63,6 +71,7 @@ impl Action {
     /// The locale key for the action's name.
     pub fn label_key(self) -> &'static str {
         match self {
+            Self::Sync => "action.sync",
             Self::Scale => "action.scale",
             Self::Restart => "action.restart",
             Self::Cordon => "action.cordon",
@@ -94,6 +103,13 @@ pub fn available(resource: &ApiResource, object: &Object) -> Vec<Action> {
     let restartable = matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet");
     let mut actions = Vec::new();
     if resource.supports("patch") {
+        let argo_application = resource.group == "argoproj.io" && kind == "Application";
+        let operation = object.str_at("status.operationState.phase");
+        let idle = !matches!(operation, "Running" | "Terminating")
+            && object.at("operation").is_none_or(Value::is_null);
+        if argo_application && idle {
+            actions.push(Action::Sync);
+        }
         if scalable {
             actions.push(Action::Scale);
         }
@@ -143,6 +159,21 @@ pub fn restart(now: DateTime<Utc>) -> Patch {
         "spec": {"template": {"metadata": {"annotations": {
             "kubectl.kubernetes.io/restartedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         }}}}
+    }))
+}
+
+/// Ask Argo CD to sync the whole Application at its configured revision.
+///
+/// Revision, resource filters and prune are deliberately absent: this is the
+/// least surprising equivalent of `argocd app sync NAME`, and cannot inherit
+/// a selective resource list from Kirikumo because Kirikumo never creates
+/// one. Argo's controller consumes and clears the top-level operation.
+pub fn sync() -> Patch {
+    Patch::Merge(json!({
+        "operation": {
+            "initiatedBy": {"username": "kirikumo"},
+            "sync": {}
+        }
     }))
 }
 
@@ -259,6 +290,26 @@ mod tests {
     }
 
     #[test]
+    fn only_an_idle_argo_application_offers_sync() {
+        let mut application = resource("Application", FULL);
+        application.group = "argoproj.io".into();
+        let idle = available(&application, &object(json!({"status": {}})));
+        assert!(idle.contains(&Action::Sync));
+
+        let running = available(
+            &application,
+            &object(json!({"status": {"operationState": {"phase": "Running"}}})),
+        );
+        assert!(!running.contains(&Action::Sync));
+
+        let unrelated = available(
+            &resource("Application", FULL),
+            &object(json!({"status": {}})),
+        );
+        assert!(!unrelated.contains(&Action::Sync));
+    }
+
+    #[test]
     fn a_node_offers_cordon_or_uncordon_depending_on_where_it_is() {
         let node = resource("Node", FULL);
         assert!(available(&node, &object(json!({"spec": {}}))).contains(&Action::Cordon));
@@ -306,6 +357,7 @@ mod tests {
     #[test]
     fn each_action_names_the_verb_rbac_will_be_asked_about() {
         assert_eq!(Action::Delete.verb(), "delete");
+        assert_eq!(Action::Sync.verb(), "patch");
         assert_eq!(Action::Scale.verb(), "patch");
         assert_eq!(Action::Restart.verb(), "patch");
         assert_eq!(Action::Cordon.verb(), "patch");
@@ -334,6 +386,19 @@ mod tests {
         assert_eq!(
             body.pointer("/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"),
             Some(&json!("2026-09-12T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn syncing_asks_argo_for_a_full_non_pruning_sync_at_the_configured_revision() {
+        assert_eq!(
+            sync(),
+            Patch::Merge(json!({
+                "operation": {
+                    "initiatedBy": {"username": "kirikumo"},
+                    "sync": {}
+                }
+            }))
         );
     }
 

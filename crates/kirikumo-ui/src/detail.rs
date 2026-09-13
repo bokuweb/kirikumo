@@ -39,6 +39,16 @@ pub enum Target {
     },
 }
 
+/// Whether this resource can meaningfully have related Kubernetes Events.
+///
+/// An Event is already the record of something happening to another object;
+/// Kubernetes does not normally emit Events whose subject is another Event.
+/// Hiding that recursive tab keeps the cluster-wide Events list distinct from
+/// an object's related-events tab.
+pub fn has_related_events(resource: &ResourceKey) -> bool {
+    !(resource.kind == "Event" && (resource.group.is_empty() || resource.group == "events.k8s.io"))
+}
+
 /// One labelled fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fact {
@@ -124,6 +134,21 @@ pub fn overview(
     usage: Option<&Metrics>,
     now: DateTime<Utc>,
 ) -> Overview {
+    overview_for(&ResourceKey::new("", kind), object, usage, now)
+}
+
+/// Build the Overview when the resource's API group is known.
+///
+/// The group matters for integrations whose kinds have ordinary names: only
+/// `Application.argoproj.io` is an Argo CD application. Keeping this decision
+/// here avoids teaching the GPUI view about the custom resource's schema.
+pub fn overview_for(
+    resource: &ResourceKey,
+    object: &Object,
+    usage: Option<&Metrics>,
+    now: DateTime<Utc>,
+) -> Overview {
+    let kind = resource.kind.as_str();
     let mut sections = vec![metadata(object, now)];
     if let Some(usage) = usage {
         sections.push(self::usage(kind, object, usage));
@@ -139,10 +164,156 @@ pub fn overview(
         "ConfigMap" | "Secret" => sections.extend(keys(object)),
         _ => {}
     }
+    if resource.group == crate::gitops::ARGO_CD_GROUP && kind == "Application" {
+        sections.extend(application(object));
+    }
+    if resource.group == crate::gitops::ARGO_CD_GROUP && kind == "ApplicationSet" {
+        sections.extend(application_set(object));
+    }
+    if resource.group == crate::gitops::ARGO_CD_GROUP && kind == "AppProject" {
+        sections.extend(app_project(object));
+    }
     Overview {
         sections,
         conditions: conditions(object),
     }
+}
+
+/// What Argo CD has reconciled for an Application, read from the CR itself.
+fn application(object: &Object) -> Vec<Section> {
+    let application = crate::gitops::Application::from_object(object);
+    let mut status = Vec::new();
+    push_text(&mut status, "Project", &application.project);
+    push_text(&mut status, "Sync", &application.sync);
+    push_text(&mut status, "Health", &application.health);
+    push_text(&mut status, "Operation", &application.operation);
+    push_id(&mut status, "Revision", &application.revision);
+    push_id(&mut status, "Destination", &application.destination);
+    push_text(&mut status, "Policy", &application.sync_policy);
+    status.push(Fact::text("Managed", application.resources_summary()));
+
+    let repositories = application
+        .sources
+        .iter()
+        .map(|source| source.repository.as_str())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let locations = application
+        .sources
+        .iter()
+        .filter_map(
+            |source| match (source.path.is_empty(), source.chart.is_empty()) {
+                (false, _) => Some(source.path.as_str()),
+                (true, false) => Some(source.chart.as_str()),
+                (true, true) => None,
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    let revisions = application
+        .sources
+        .iter()
+        .map(|source| source.target_revision.as_str())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut sources = Vec::new();
+    push_id(&mut sources, "Repositories", &repositories);
+    push_id(&mut sources, "Paths / charts", &locations);
+    push_id(&mut sources, "Target revisions", &revisions);
+
+    let mut sections = vec![Section {
+        title: Some("GitOps".into()),
+        facts: status,
+    }];
+    if !sources.is_empty() {
+        sections.push(Section {
+            title: Some("Sources".into()),
+            facts: sources,
+        });
+    }
+    sections
+}
+
+/// What an Argo CD ApplicationSet generates, read from the CR itself.
+fn application_set(object: &Object) -> Vec<Section> {
+    let application_set = crate::gitops::ApplicationSet::from_object(object);
+    let mut facts = Vec::new();
+    push_text(&mut facts, "Project", &application_set.project);
+    push_text(
+        &mut facts,
+        "Generators",
+        &application_set.generators.join(" · "),
+    );
+    facts.push(Fact::text(
+        "Generated",
+        format!("{} applications", application_set.applications),
+    ));
+    push_id(&mut facts, "Destination", &application_set.destination);
+    if application_set.go_template {
+        facts.push(Fact::text("Template", "Go template"));
+    }
+    push_text(&mut facts, "Strategy", &application_set.strategy);
+    push_text(&mut facts, "Health", &application_set.health);
+    vec![Section {
+        title: Some("GitOps".into()),
+        facts,
+    }]
+}
+
+/// The boundaries an Argo CD AppProject puts around its Applications.
+fn app_project(object: &Object) -> Vec<Section> {
+    let project = crate::gitops::AppProject::from_object(object);
+    let mut facts = Vec::new();
+    push_text(&mut facts, "Description", &project.description);
+    push_id(
+        &mut facts,
+        "Source repositories",
+        &project.source_repositories.join("\n"),
+    );
+    push_id(
+        &mut facts,
+        "Source namespaces",
+        &project.source_namespaces.join(" · "),
+    );
+    push_id(&mut facts, "Destinations", &project.destinations.join("\n"));
+    push_id(
+        &mut facts,
+        "Cluster allow",
+        &project.cluster_allow.join(" · "),
+    );
+    push_id(
+        &mut facts,
+        "Cluster deny",
+        &project.cluster_deny.join(" · "),
+    );
+    push_id(
+        &mut facts,
+        "Namespace allow",
+        &project.namespace_allow.join(" · "),
+    );
+    push_id(
+        &mut facts,
+        "Namespace deny",
+        &project.namespace_deny.join(" · "),
+    );
+    push_id(&mut facts, "Roles", &project.roles.join(" · "));
+    push_text(
+        &mut facts,
+        "Orphaned resources",
+        &project.orphaned_resources,
+    );
+    if project.project_scoped_clusters_only {
+        facts.push(Fact::text("Clusters", "Project-scoped only"));
+    }
+    if project.sync_windows > 0 {
+        facts.push(Fact::text("Sync windows", project.sync_windows.to_string()));
+    }
+    vec![Section {
+        title: Some("GitOps".into()),
+        facts,
+    }]
 }
 
 /// What an object is using right now, and — for a node — what share of it
@@ -388,11 +559,13 @@ fn controller(object: &Object) -> Vec<Section> {
     // person would answer it — by putting the selector in the filter box —
     // rather than by asking the apiserver a question it has no endpoint for.
     if !selector.is_empty() {
-        facts.push(Fact::id("Selector", selector.clone()).to(Target::Filtered {
+        let pods = Target::Filtered {
             key: ResourceKey::new("", "Pod"),
             namespace: object.meta.namespace.clone(),
             query: first_label(&selector),
-        }));
+        };
+        facts.push(Fact::id("Selector", selector.clone()).to(pods.clone()));
+        facts.push(Fact::id("Pod logs", "Select a pod").to(pods));
     }
     let images = object
         .array_at("spec.template.spec.containers")
@@ -818,6 +991,17 @@ mod tests {
     }
 
     #[test]
+    fn event_objects_do_not_offer_a_tab_for_events_about_the_event() {
+        assert!(!has_related_events(&ResourceKey::new("", "Event")));
+        assert!(!has_related_events(&ResourceKey::new(
+            "events.k8s.io",
+            "Event"
+        )));
+        assert!(has_related_events(&ResourceKey::new("", "Pod")));
+        assert!(has_related_events(&ResourceKey::new("apps", "Deployment")));
+    }
+
+    #[test]
     fn a_controller_points_down_at_the_pods_it_selects() {
         let overview = overview(
             "Deployment",
@@ -831,6 +1015,14 @@ mod tests {
         );
         assert_eq!(
             linked(&overview, "Selector").link,
+            Some(Target::Filtered {
+                key: ResourceKey::new("", "Pod"),
+                namespace: Some("shop".into()),
+                query: "app=api".into(),
+            })
+        );
+        assert_eq!(
+            linked(&overview, "Pod logs").link,
             Some(Target::Filtered {
                 key: ResourceKey::new("", "Pod"),
                 namespace: Some("shop".into()),
@@ -854,6 +1046,136 @@ mod tests {
             linked(&overview, "Selector").link,
             Some(Target::Filtered { .. })
         ));
+    }
+
+    #[test]
+    fn an_argo_application_gets_a_native_gitops_summary() {
+        let overview = overview_for(
+            &ResourceKey::new("argoproj.io", "Application"),
+            &object(json!({
+                "metadata": {"name": "shop", "namespace": "argocd"},
+                "spec": {
+                    "project": "production",
+                    "destination": {"server": "https://kubernetes.default.svc", "namespace": "shop"},
+                    "source": {"repoURL": "https://github.com/acme/shop", "path": "deploy",
+                               "targetRevision": "main"},
+                    "syncPolicy": {"automated": {"prune": true}}
+                },
+                "status": {
+                    "sync": {"status": "OutOfSync", "revision": "abc123"},
+                    "health": {"status": "Degraded"},
+                    "resources": [
+                        {"group": "apps", "kind": "Deployment", "name": "api",
+                         "status": "OutOfSync", "health": {"status": "Degraded"}}
+                    ]
+                }
+            })),
+            None,
+            now(),
+        );
+        assert!(
+            overview
+                .sections
+                .iter()
+                .any(|section| section.title.as_deref() == Some("GitOps"))
+        );
+        let facts = facts(&overview);
+        assert!(facts.contains(&("Project", "production")));
+        assert!(facts.contains(&("Sync", "OutOfSync")));
+        assert!(facts.contains(&("Managed", "1 resources · 1 out of sync · 1 unhealthy")));
+        assert!(facts.contains(&("Repositories", "https://github.com/acme/shop")));
+    }
+
+    #[test]
+    fn an_unrelated_application_kind_does_not_get_argo_fields() {
+        let overview = overview_for(
+            &ResourceKey::new("example.com", "Application"),
+            &object(json!({
+                "metadata": {"name": "something"},
+                "spec": {"project": "not-argo"}
+            })),
+            None,
+            now(),
+        );
+        assert!(
+            !overview
+                .sections
+                .iter()
+                .any(|section| section.title.as_deref() == Some("GitOps"))
+        );
+    }
+
+    #[test]
+    fn an_argo_application_set_gets_a_native_generation_summary() {
+        let overview = overview_for(
+            &ResourceKey::new("argoproj.io", "ApplicationSet"),
+            &object(json!({
+                "metadata": {"name": "environments", "namespace": "argocd"},
+                "spec": {
+                    "goTemplate": true,
+                    "generators": [{"git": {}}, {"clusters": {}}],
+                    "template": {"spec": {
+                        "project": "platform",
+                        "destination": {"name": "in-cluster", "namespace": "{{.namespace}}"}
+                    }},
+                    "strategy": {"type": "RollingSync"}
+                },
+                "status": {
+                    "resourcesCount": 8,
+                    "health": {"status": "Progressing"}
+                }
+            })),
+            None,
+            now(),
+        );
+
+        assert!(
+            overview
+                .sections
+                .iter()
+                .any(|section| section.title.as_deref() == Some("GitOps"))
+        );
+        let facts = facts(&overview);
+        assert!(facts.contains(&("Project", "platform")));
+        assert!(facts.contains(&("Generators", "git · clusters")));
+        assert!(facts.contains(&("Generated", "8 applications")));
+        assert!(facts.contains(&("Destination", "in-cluster · {{.namespace}}")));
+        assert!(facts.contains(&("Template", "Go template")));
+        assert!(facts.contains(&("Strategy", "RollingSync")));
+    }
+
+    #[test]
+    fn an_argo_app_project_gets_a_native_policy_summary() {
+        let overview = overview_for(
+            &ResourceKey::new("argoproj.io", "AppProject"),
+            &object(json!({
+                "metadata": {"name": "production", "namespace": "argocd"},
+                "spec": {
+                    "description": "Production workloads",
+                    "sourceRepos": ["https://github.com/acme/*"],
+                    "destinations": [{"name": "production", "namespace": "shop-*"}],
+                    "clusterResourceWhitelist": [{"group": "", "kind": "Namespace"}],
+                    "namespaceResourceBlacklist": [{"group": "", "kind": "Secret"}],
+                    "roles": [{"name": "read-only"}, {"name": "deploy"}],
+                    "orphanedResources": {"warn": true, "ignore": []},
+                    "permitOnlyProjectScopedClusters": true,
+                    "syncWindows": [{"kind": "deny"}]
+                }
+            })),
+            None,
+            now(),
+        );
+
+        let facts = facts(&overview);
+        assert!(facts.contains(&("Description", "Production workloads")));
+        assert!(facts.contains(&("Source repositories", "https://github.com/acme/*")));
+        assert!(facts.contains(&("Destinations", "production · shop-*")));
+        assert!(facts.contains(&("Cluster allow", "core/Namespace")));
+        assert!(facts.contains(&("Namespace deny", "core/Secret")));
+        assert!(facts.contains(&("Roles", "read-only · deploy")));
+        assert!(facts.contains(&("Orphaned resources", "Warnings enabled · 0 ignored")));
+        assert!(facts.contains(&("Clusters", "Project-scoped only")));
+        assert!(facts.contains(&("Sync windows", "1")));
     }
 
     #[test]

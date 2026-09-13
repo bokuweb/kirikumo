@@ -9,9 +9,10 @@
 use crate::settings::Appearance;
 use crate::terminal::Colour;
 use gpui::{App, Global, Hsla, Rgba, WindowAppearance};
+use gpui_component::highlighter::HighlightTheme;
 use kirikumo_kube::Level;
 use serde::{Deserialize, Deserializer};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 const DARK: &str = include_str!("../../../assets/themes/dark.json");
 const LIGHT: &str = include_str!("../../../assets/themes/light.json");
@@ -210,6 +211,14 @@ impl Tokens {
             ThemeAppearance::Light => gpui::rgb(0x1E1B4B).into(),
         }
     }
+
+    /// A table head separated from the glass without becoming an opaque band.
+    pub fn table_head(&self) -> Hsla {
+        match self.appearance {
+            ThemeAppearance::Dark => gpui::black().opacity(0.35),
+            ThemeAppearance::Light => self.colors.text_primary.opacity(0.07),
+        }
+    }
 }
 
 impl Global for Tokens {}
@@ -330,16 +339,36 @@ impl Colors {
         self.accent.opacity(0.22)
     }
 
-    /// A table's head: black at a third over the glass, so it reads as a band
-    /// and still lets the blur through.
-    pub fn table_head(&self) -> Hsla {
-        gpui::black().opacity(0.35)
-    }
-
     /// A raised control the pointer is over.
     pub fn surface_hover(&self) -> Hsla {
         self.bg_raised.opacity((self.bg_raised.a + 0.14).min(1.0))
     }
+}
+
+/// Build the editor palette from the toolkit's matching syntax theme, then
+/// replace its surfaces with Kirikumo's tokens.
+fn editor_highlight_theme(mode: Mode, tokens: &Tokens) -> Arc<HighlightTheme> {
+    let (appearance, base) = match mode {
+        Mode::Dark => (
+            gpui_component::ThemeMode::Dark,
+            HighlightTheme::default_dark(),
+        ),
+        Mode::Light => (
+            gpui_component::ThemeMode::Light,
+            HighlightTheme::default_light(),
+        ),
+    };
+    let mut theme = (*base).clone();
+    theme.name = format!("{} editor", tokens.name);
+    theme.appearance = appearance;
+    theme.style.editor_background = Some(tokens.colors.code_bg);
+    theme.style.editor_foreground = Some(tokens.colors.text_primary);
+    theme.style.editor_gutter_background = Some(tokens.colors.code_bg);
+    theme.style.editor_line_number = Some(tokens.colors.text_muted);
+    theme.style.editor_active_line_number = Some(tokens.colors.text_secondary);
+    theme.style.editor_invisible = Some(tokens.colors.text_muted.opacity(0.45));
+    theme.style.editor_active_line = Some(tokens.colors.row_hover());
+    Arc::new(theme)
 }
 
 /// Push our tokens into `gpui-component`'s theme.
@@ -350,6 +379,8 @@ impl Colors {
 /// app should touch `Theme::global_mut`.
 pub fn apply(mode: Mode, cx: &mut App) {
     Tokens::install(mode, cx);
+    let table_head = Tokens::global(cx).table_head();
+    let highlight_theme = editor_highlight_theme(mode, Tokens::global(cx));
     let tokens = *Tokens::global(cx).colors();
     let radii = Tokens::global(cx).radius;
 
@@ -412,9 +443,9 @@ pub fn apply(mode: Mode, cx: &mut App) {
     theme.colors.link_hover = tokens.accent.opacity(0.85);
     theme.colors.link_active = tokens.accent.opacity(0.7);
     theme.colors.table = tokens.transparent_surface();
-    theme.colors.table_head = tokens.table_head();
+    theme.colors.table_head = table_head;
     theme.colors.table_head_foreground = tokens.text_secondary;
-    theme.colors.table_foot = tokens.table_head();
+    theme.colors.table_foot = table_head;
     theme.colors.table_foot_foreground = tokens.text_secondary;
     theme.colors.table_even = tokens.transparent_surface();
     theme.colors.table_row_border = tokens.border_subtle;
@@ -434,6 +465,7 @@ pub fn apply(mode: Mode, cx: &mut App) {
     // mono, a step under the defaults, which is what the reference reads at.
     theme.font_size = gpui::px(13.);
     theme.mono_font_size = gpui::px(12.);
+    theme.highlight_theme = highlight_theme;
 
     // `Root` and several components paint from the derived semantic tokens
     // rather than from `colors`. Without regenerating them the window keeps
@@ -571,6 +603,53 @@ mod tests {
         let navy = Tokens::load(Mode::Light).logo();
         assert!(navy.l < 0.25, "dark enough to read on the light glass");
         assert!(navy.s > 0.3, "blue, not grey");
+    }
+
+    #[test]
+    fn yaml_highlighting_follows_the_selected_mode() {
+        let dark_tokens = Tokens::load(Mode::Dark);
+        let light_tokens = Tokens::load(Mode::Light);
+        let dark = editor_highlight_theme(Mode::Dark, &dark_tokens);
+        let light = editor_highlight_theme(Mode::Light, &light_tokens);
+
+        assert_eq!(dark.appearance, gpui_component::ThemeMode::Dark);
+        assert_eq!(light.appearance, gpui_component::ThemeMode::Light);
+        assert_eq!(
+            dark.style.editor_background,
+            Some(dark_tokens.colors.code_bg)
+        );
+        assert_eq!(
+            light.style.editor_background,
+            Some(light_tokens.colors.code_bg)
+        );
+        assert_eq!(
+            dark.style.editor_foreground,
+            Some(dark_tokens.colors.text_primary)
+        );
+        assert_eq!(
+            light.style.editor_foreground,
+            Some(light_tokens.colors.text_primary)
+        );
+        assert_eq!(
+            dark.style.editor_gutter_background,
+            Some(dark_tokens.colors.code_bg)
+        );
+        assert_eq!(
+            light.style.editor_gutter_background,
+            Some(light_tokens.colors.code_bg)
+        );
+        assert_ne!(dark.style.syntax, light.style.syntax);
+    }
+
+    #[test]
+    fn the_light_table_header_is_a_subtle_token_tint() {
+        let dark = Tokens::load(Mode::Dark).table_head();
+        let light_tokens = Tokens::load(Mode::Light);
+        let light = light_tokens.table_head();
+
+        assert!(light.a <= 0.1, "light glass must not get a dark grey band");
+        assert_eq!(light.h, light_tokens.colors.text_primary.h);
+        assert!(dark.a > light.a, "dark glass needs the stronger separator");
     }
 
     #[test]
