@@ -1,8 +1,9 @@
 //! The right panel: `docs/ui.md` §3.4.
 //!
 //! Tabs over one object — Overview, Events, YAML, an Argo CD Application's
-//! Resources, and for anything with containers Logs, Run and Shell. What each of them says is decided in
-//! `kirikumo_ui` (`detail::overview`, `terminal::Screen`) or in
+//! Resources, a Pod's or selecting workload's Logs, and a Pod's Run and
+//! Shell. What each of them says is decided in `kirikumo_ui`
+//! (`detail::overview`, `terminal::Screen`) or in
 //! `kirikumo_kube` (`yaml::to_yaml`); this file draws it.
 //!
 //! The object itself is read out of the list the table is already showing
@@ -14,6 +15,7 @@ use chrono::Utc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, StyledExt as _, h_flex, v_flex};
 use kirikumo_kube::{Action, ExecRequest, LogRequest, Object, actions, yaml};
@@ -81,6 +83,8 @@ pub struct Detail {
     store: Entity<Store>,
     key: Option<ObjectKey>,
     tab: Tab,
+    /// Which Pod supplies a workload's log. A Pod detail needs no choice.
+    pod: Option<String>,
     /// Which container's log is showing, when the object has more than one.
     container: Option<String>,
     /// Whether the log is being followed as the container writes.
@@ -178,6 +182,7 @@ impl Detail {
             store,
             key: None,
             tab: Tab::Overview,
+            pod: None,
             container: None,
             // Following is what a person opening a log wants; a tail that
             // stops the moment it is drawn is a screenshot.
@@ -208,6 +213,7 @@ impl Detail {
             // down a list of pods with the YAML tab open wants the next
             // pod's YAML — but the container does not, since it named one
             // of the last object's, and neither does a shell into it.
+            self.pod = None;
             self.container = None;
             self.store.update(cx, |store, _| store.detach_shell());
         }
@@ -247,6 +253,7 @@ impl Detail {
     /// Fetch again whatever the open tab is showing.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.tab == Tab::Logs {
+            self.refresh_workload_pods(cx);
             self.reload_log(cx);
             return;
         }
@@ -271,7 +278,10 @@ impl Detail {
         // will not: it asks only for what has never been asked for, and this
         // log's lines are still here from last time.
         match entering_logs {
-            true => self.reload_log(cx),
+            true => {
+                self.ensure(cx);
+                self.reload_log(cx);
+            }
             false => self.ensure(cx),
         }
         cx.notify();
@@ -363,6 +373,16 @@ impl Detail {
                     .update(cx, |store, cx| store.ensure_events(uid, namespace, cx));
             }
             Tab::Logs => {
+                if detail::has_workload_logs(&object) {
+                    let namespace = object.meta.namespace.clone();
+                    self.store.update(cx, |store, cx| {
+                        store.ensure_list(
+                            kirikumo_kube::ResourceKey::new("", "Pod"),
+                            namespace.as_deref(),
+                            cx,
+                        )
+                    });
+                }
                 if let Some(request) = self.log_request(cx) {
                     let following = self.following;
                     // Only when nothing has been asked for yet: `ensure` runs
@@ -421,17 +441,85 @@ impl Detail {
             .unwrap_or_default()
     }
 
+    /// Pods selected by the workload in this panel, newest first.
+    fn workload_pods(&self, cx: &App) -> Vec<Object> {
+        let Some(workload) = self.object(cx) else {
+            return Vec::new();
+        };
+        if !detail::has_workload_logs(&workload) {
+            return Vec::new();
+        }
+        let pod_key = kirikumo_kube::ResourceKey::new("", "Pod");
+        let Some(pods) = self
+            .store
+            .read(cx)
+            .list(&pod_key, workload.meta.namespace.as_deref())
+            .and_then(|fetch| fetch.value())
+        else {
+            return Vec::new();
+        };
+        detail::workload_log_pods(&workload, &pods.items)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// The Pod whose log is currently selected.
+    fn log_pod(&self, cx: &App) -> Option<Object> {
+        let object = self.object(cx)?;
+        if !detail::has_workload_logs(&object) {
+            return Some(object);
+        }
+        let pods = self.workload_pods(cx);
+        self.pod
+            .as_ref()
+            .and_then(|name| pods.iter().find(|pod| &pod.meta.name == name))
+            .or_else(|| pods.first())
+            .cloned()
+    }
+
+    /// Containers on the Pod currently supplying the log.
+    fn log_containers(&self, cx: &App) -> Vec<String> {
+        self.log_pod(cx)
+            .map(|pod| {
+                pod.array_at("spec.containers")
+                    .iter()
+                    .filter_map(|container| container.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn refresh_workload_pods(&mut self, cx: &mut Context<Self>) {
+        let Some(workload) = self.object(cx) else {
+            return;
+        };
+        if !detail::has_workload_logs(&workload) {
+            return;
+        }
+        let namespace = workload.meta.namespace.clone();
+        self.store.update(cx, |store, cx| {
+            store.load_list(
+                kirikumo_kube::ResourceKey::new("", "Pod"),
+                namespace.as_deref(),
+                cx,
+            )
+        });
+    }
+
     /// What to ask for on the Logs tab.
     fn log_request(&self, cx: &App) -> Option<LogRequest> {
-        let object = self.object(cx)?;
-        let namespace = object.meta.namespace.clone()?;
-        let containers = self.containers(cx);
+        let pod = self.log_pod(cx)?;
+        let namespace = pod.meta.namespace.clone()?;
+        let containers = self.log_containers(cx);
         let container = self
             .container
             .clone()
+            .filter(|selected| containers.contains(selected))
             .or_else(|| containers.first().cloned())?;
         Some(
-            LogRequest::new(namespace, object.meta.name.clone())
+            LogRequest::new(namespace, pod.meta.name.clone())
                 .container(container)
                 .previous(self.previous),
         )
@@ -502,6 +590,9 @@ impl Detail {
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let tokens = Tokens::global(cx).clone();
         let has_containers = !self.containers(cx).is_empty();
+        let has_workload_logs = self
+            .object(cx)
+            .is_some_and(|object| detail::has_workload_logs(&object));
         let mut tabs = vec![Tab::Overview];
         if self
             .key
@@ -518,8 +609,11 @@ impl Detail {
             tabs.push(Tab::Events);
         }
         tabs.push(Tab::Yaml);
+        if has_containers || has_workload_logs {
+            tabs.push(Tab::Logs);
+        }
         if has_containers {
-            tabs.extend([Tab::Logs, Tab::Run, Tab::Shell]);
+            tabs.extend([Tab::Run, Tab::Shell]);
         }
         h_flex()
             .w_full()
@@ -1913,10 +2007,20 @@ impl Detail {
     /// The Logs tab: what to read, and then the reading of it.
     fn logs(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Tokens::global(cx).clone();
-        let containers = self.containers(cx);
+        let workload = self
+            .object(cx)
+            .is_some_and(|object| detail::has_workload_logs(&object));
+        let pods = self.workload_pods(cx);
+        let current_pod = self
+            .log_pod(cx)
+            .filter(|_| workload)
+            .map(|pod| pod.meta.name)
+            .unwrap_or_default();
+        let containers = self.log_containers(cx);
         let current = self
             .container
             .clone()
+            .filter(|selected| containers.contains(selected))
             .or_else(|| containers.first().cloned())
             .unwrap_or_default();
         let fetch = self
@@ -1954,7 +2058,55 @@ impl Detail {
         self.scrolled_last_frame = self.following && arrived;
         self.last_lines = lines.len();
 
-        let toolbar = h_flex()
+        let pod_picker = (workload && !pods.is_empty()).then(|| {
+            h_flex()
+                .w_full()
+                .px_3()
+                .pt_1p5()
+                .gap_1()
+                .flex_shrink_0()
+                .items_center()
+                .overflow_x_scrollbar()
+                .child(
+                    div()
+                        .mr_1()
+                        .flex_shrink_0()
+                        .text_size(px(10.5))
+                        .text_color(tokens.colors().text_muted)
+                        .child(rust_i18n::t!("detail.pod").to_string()),
+                )
+                .children(pods.into_iter().enumerate().map(|(index, pod)| {
+                    let name = pod.meta.name;
+                    let selected = name == current_pod;
+                    let picked = name.clone();
+                    div()
+                        .id(("log-pod", index))
+                        .px_2()
+                        .py_0p5()
+                        .flex_shrink_0()
+                        .rounded(px(tokens.radius.control()))
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .font_family("monospace")
+                        .when(selected, |this| {
+                            this.bg(tokens.colors().row_active())
+                                .text_color(tokens.colors().text_primary)
+                        })
+                        .when(!selected, |this| {
+                            this.text_color(tokens.colors().text_muted)
+                        })
+                        .hover(|this| this.bg(tokens.colors().row_hover()))
+                        .child(name)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pod = Some(picked.clone());
+                            this.container = None;
+                            this.stop_following(cx);
+                            this.reload_log(cx);
+                        }))
+                }))
+        });
+
+        let controls = h_flex()
             .w_full()
             .px_3()
             .py_1p5()
@@ -2030,6 +2182,28 @@ impl Detail {
                 )
             });
 
+        let toolbar = v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .children(pod_picker)
+            .child(controls);
+
+        let workload_pods_fetch = self.object(cx).and_then(|object| {
+            let pod_key = kirikumo_kube::ResourceKey::new("", "Pod");
+            self.store
+                .read(cx)
+                .list(&pod_key, object.meta.namespace.as_deref())
+                .cloned()
+        });
+        let workload_pods_loading = workload
+            && workload_pods_fetch
+                .as_ref()
+                .is_none_or(|fetch| fetch.is_loading());
+        let workload_pods_error = workload_pods_fetch
+            .as_ref()
+            .and_then(|fetch| fetch.error())
+            .map(str::to_string);
+
         let body: AnyElement = if !visible.is_empty() {
             let colors = *tokens.colors();
             // Cloned into the closure rather than read from the store on each
@@ -2059,6 +2233,16 @@ impl Detail {
             .track_scroll(&self.scroll)
             .size_full()
             .into_any_element()
+        } else if workload_pods_loading {
+            crate::skeleton::detail(cx)
+        } else if let Some(error) = workload_pods_error {
+            self.notice(error, true, cx)
+        } else if workload && self.log_pod(cx).is_none() {
+            self.notice(
+                rust_i18n::t!("detail.workload_logs_empty").to_string(),
+                false,
+                cx,
+            )
         } else if let Some(error) = error {
             self.notice(error, true, cx)
         } else if loading {

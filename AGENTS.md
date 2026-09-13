@@ -33,6 +33,7 @@ KIRIKUMO_DEMO=1 cargo run                   # the same window over a scripted cl
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_PALETTE=1 cargo run   # ...opened on the palette, for screenshots
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN=Pod/shop/api-7d9f8c-2xk4t cargo run   # ...opened on one object
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Pod/shop/api-7d9f8c-2xk4t#logs' cargo run  # ...on its log, following (#events, #yaml, #run, #shell too)
+KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Deployment.apps/shop/api#logs' cargo run  # ...on a workload's Pod picker and log
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Application.argoproj.io/argocd/shop#resources' cargo run  # ...on the Argo CD Resources tab
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='ApplicationSet.argoproj.io/argocd/environments' cargo run  # ...on an ApplicationSet
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='AppProject.argoproj.io/argocd/production' cargo run  # ...on an AppProject

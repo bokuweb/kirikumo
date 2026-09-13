@@ -128,6 +128,12 @@ detail.yaml:
 detail.logs:
   en: Logs
   ja: ログ
+detail.pod:
+  en: Pod
+  ja: Pod
+detail.workload_logs_empty:
+  en: No Pods match this workload.
+  ja: このワークロードに一致する Pod はありません。
 detail.run:
   en: Run
   ja: 実行
