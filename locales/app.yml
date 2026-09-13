@@ -228,6 +228,9 @@ detail.container:
 action.sync:
   en: Sync
   ja: 同期
+action.trigger:
+  en: Trigger
+  ja: 今すぐ実行
 action.scale:
   en: Scale
   ja: スケール
@@ -273,6 +276,12 @@ action.replicas:
 action.confirm.sync:
   en: "Sync %{name}"
   ja: "%{name} を同期"
+action.confirm.trigger:
+  en: "Trigger %{name} now"
+  ja: "%{name} を今すぐ実行"
+action.triggered:
+  en: "Created Job %{name}"
+  ja: "Job %{name} を作成しました"
 action.confirm.scale:
   en: "Scale %{name} to %{replicas}"
   ja: "%{name} を %{replicas} にスケール"

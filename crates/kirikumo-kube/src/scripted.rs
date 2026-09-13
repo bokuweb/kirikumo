@@ -16,7 +16,7 @@
 //! apiserver does, so the whole M4 flow — the two gestures, the request, the
 //! row changing under the reader — can be seen with no cluster to break.
 
-use crate::actions::merge_patch;
+use crate::actions::{self, merge_patch};
 use crate::error::{Error, Result};
 use crate::exec::{ExecOutput, ExecRequest};
 use crate::logs::LogStream;
@@ -106,6 +106,7 @@ impl Scripted {
             resource("apps", "v1", "Deployment", "deployments", true),
             resource("apps", "v1", "ReplicaSet", "replicasets", true),
             patchable(resource("batch", "v1", "CronJob", "cronjobs", true)),
+            createable(resource("batch", "v1", "Job", "jobs", true)),
             resource("", "v1", "ConfigMap", "configmaps", true),
             resource("", "v1", "Service", "services", true),
             resource(
@@ -258,14 +259,31 @@ impl Scripted {
                     "apiVersion": "batch/v1", "kind": "CronJob",
                     "metadata": {"name": "backup", "namespace": "observability", "uid": "cj-backup",
                                  "creationTimestamp": ago(60 * 24 * 20)},
-                    "spec": {"schedule": "0 2 * * *", "suspend": false},
+                    "spec": {
+                        "schedule": "0 2 * * *",
+                        "suspend": false,
+                        "jobTemplate": {
+                            "metadata": {"labels": {"app": "backup"}},
+                            "spec": {"template": {"spec": {
+                                "restartPolicy": "Never",
+                                "containers": [{"name": "backup", "image": "ghcr.io/ops/backup:3"}]
+                            }}}
+                        }
+                    },
                     "status": {"lastScheduleTime": ago(700)}
                 }),
                 json!({
                     "apiVersion": "batch/v1", "kind": "CronJob",
                     "metadata": {"name": "reindex", "namespace": "shop", "uid": "cj-reindex",
                                  "creationTimestamp": ago(60 * 24 * 20)},
-                    "spec": {"schedule": "*/15 * * * *", "suspend": true},
+                    "spec": {
+                        "schedule": "*/15 * * * *",
+                        "suspend": true,
+                        "jobTemplate": {"spec": {"template": {"spec": {
+                            "restartPolicy": "Never",
+                            "containers": [{"name": "reindex", "image": "ghcr.io/shop/reindex:1"}]
+                        }}}}
+                    },
                     "status": {}
                 }),
             ]),
@@ -771,6 +789,38 @@ impl Cluster for Scripted {
         Ok(updated)
     }
 
+    fn trigger_cron_job(&self, resource: &ApiResource, cron_job: &Object) -> Result<Object> {
+        if resource.group != "batch" || resource.kind != "CronJob" {
+            return Err(Error::Malformed(
+                "only a batch CronJob can be triggered".into(),
+            ));
+        }
+        let version = self.bump();
+        let mut raw = actions::manual_job(cron_job)?;
+        let prefix = raw
+            .pointer("/metadata/generateName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Malformed("manual Job has no generateName".into()))?;
+        let name = format!("{prefix}{version:0>5}");
+        let metadata = raw
+            .pointer_mut("/metadata")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::Malformed("manual Job has no metadata".into()))?;
+        metadata.remove("generateName");
+        metadata.insert("name".into(), json!(name));
+        metadata.insert("uid".into(), json!(format!("job-{version}")));
+        metadata.insert("resourceVersion".into(), json!(version));
+        metadata.insert("creationTimestamp".into(), json!(Utc::now().to_rfc3339()));
+        let created = Object::new(raw)?;
+        self.objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(ResourceKey::new("batch", "Job"))
+            .or_default()
+            .push(created.clone());
+        Ok(created)
+    }
+
     fn events_for(&self, uid: &str, _namespace: Option<&str>) -> Result<Vec<EventRecord>> {
         Ok(self.events.get(uid).cloned().unwrap_or_default())
     }
@@ -853,6 +903,11 @@ fn resource(group: &str, version: &str, kind: &str, name: &str, namespaced: bool
 
 fn patchable(mut resource: ApiResource) -> ApiResource {
     resource.verbs.push("patch".into());
+    resource
+}
+
+fn createable(mut resource: ApiResource) -> ApiResource {
+    resource.verbs.push("create".into());
     resource
 }
 
@@ -1478,6 +1533,42 @@ mod tests {
         assert!(
             crate::actions::available(&cron_jobs, &resumed)
                 .contains(&crate::actions::Action::Suspend)
+        );
+    }
+
+    #[test]
+    fn a_sample_cron_job_triggers_a_real_job_from_its_template() {
+        let cluster = Scripted::sample();
+        let cron_jobs = resource_for(&cluster, "batch", "CronJob");
+        let jobs = resource_for(&cluster, "batch", "Job");
+        let cron_job = cluster
+            .get(&cron_jobs, Some("observability"), "backup")
+            .unwrap();
+
+        let created = cluster.trigger_cron_job(&cron_jobs, &cron_job).unwrap();
+
+        assert!(created.meta.name.starts_with("backup-manual-"));
+        assert_eq!(created.meta.namespace.as_deref(), Some("observability"));
+        assert_eq!(
+            created
+                .raw
+                .pointer("/metadata/annotations/cronjob.kubernetes.io~1instantiate")
+                .and_then(Value::as_str),
+            Some("manual")
+        );
+        assert_eq!(created.str_at("spec.template.spec.restartPolicy"), "Never");
+        assert!(
+            cluster
+                .get(&jobs, Some("observability"), &created.meta.name)
+                .is_ok()
+        );
+        assert_eq!(
+            cluster
+                .list(&jobs, Some("observability"))
+                .unwrap()
+                .items
+                .len(),
+            1
         );
     }
 

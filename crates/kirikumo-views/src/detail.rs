@@ -384,14 +384,16 @@ impl Detail {
                     Some((key, resource))
                 })
         {
-            let verbs: Vec<&'static str> = actions::available(&resource, &object)
-                .into_iter()
-                .map(Action::verb)
-                .collect();
+            let offered = actions::available(&resource, &object);
             let namespace = namespace.filter(|_| resource.namespaced);
             self.store.update(cx, |store, cx| {
-                for verb in verbs {
-                    store.ensure_permission(key.clone(), namespace.clone(), verb, cx);
+                for action in offered {
+                    store.ensure_permission(
+                        action.permission_target(&key),
+                        namespace.clone(),
+                        action.verb(),
+                        cx,
+                    );
                 }
             });
         }
@@ -1286,11 +1288,12 @@ impl Detail {
     fn permission(&self, action: Action, cx: &App) -> Option<bool> {
         let (key, namespace, _) = self.key.as_ref()?;
         let store = self.store.read(cx);
+        let target = action.permission_target(key);
         let namespaced = store
-            .resource(key)
+            .resource(&target)
             .is_none_or(|resource| resource.namespaced);
         let namespace = namespace.as_deref().filter(|_| namespaced);
-        store.permission(key, namespace, action.verb())
+        store.permission(&target, namespace, action.verb())
     }
 
     /// The first gesture.
@@ -1323,6 +1326,10 @@ impl Detail {
         let write = match action {
             Action::Delete => Write::Delete,
             Action::Sync => Write::Patch(actions::sync()),
+            Action::Trigger => match self.object(cx) {
+                Some(object) => Write::TriggerCronJob(object),
+                None => return,
+            },
             Action::Scale => match self.pending.replicas() {
                 Some(count) => Write::Patch(actions::scale(count)),
                 None => return,
@@ -1456,6 +1463,7 @@ impl Detail {
                     self.button(
                         match action {
                             Action::Sync => "act-sync",
+                            Action::Trigger => "act-trigger",
                             Action::Scale => "act-scale",
                             Action::Restart => "act-restart",
                             Action::Suspend => "act-suspend",

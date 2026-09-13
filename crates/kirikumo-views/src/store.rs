@@ -35,14 +35,16 @@ pub type ObjectKey = (ResourceKey, Option<String>, String);
 /// A write, ready to send.
 ///
 /// Built by the detail panel from `kirikumo_kube::actions` and carried here
-/// whole, so the store knows nothing about *why* — only that it is a delete
-/// or a patch, which is all the trait knows either.
+/// whole, so the store knows only the narrow operation the trait exposes and
+/// not how the button that requested it was presented.
 #[derive(Debug, Clone)]
 pub enum Write {
     /// Remove the object.
     Delete,
     /// Change it.
     Patch(Patch),
+    /// Create one Job from this CronJob's template.
+    TriggerCronJob(Object),
     /// Cordon the node and move everything off it that can move.
     Drain,
 }
@@ -869,6 +871,7 @@ impl Store {
         // catalogue can say.
         let pods = self.resource(&drain::pods_key()).cloned();
         let drained = matches!(write, Write::Drain);
+        let triggered = matches!(write, Write::TriggerCronJob(_));
         self.fetch(
             cx,
             move |cluster| match write {
@@ -878,6 +881,9 @@ impl Store {
                 Write::Patch(patch) => cluster
                     .patch(&resource, scope.as_deref(), &name, patch)
                     .map(|_| String::new()),
+                Write::TriggerCronJob(cron_job) => cluster
+                    .trigger_cron_job(&resource, &cron_job)
+                    .map(|job| rust_i18n::t!("action.triggered", name = job.meta.name).to_string()),
                 Write::Drain => {
                     let pods = pods.ok_or(kirikumo_kube::Error::Unsupported)?;
                     // Slow on purpose when a budget resists; this is the
@@ -896,10 +902,15 @@ impl Store {
                     // moved pods as well as touching the node, so their
                     // lists are asked for too.
                     let pods = drain::pods_key();
+                    let jobs = ResourceKey::new("batch", "Job");
                     let held: Vec<ListKey> = this
                         .lists
                         .keys()
-                        .filter(|(kind, _)| *kind == key || (drained && *kind == pods))
+                        .filter(|(kind, _)| {
+                            *kind == key
+                                || (drained && *kind == pods)
+                                || (triggered && *kind == jobs)
+                        })
                         .cloned()
                         .collect();
                     for (kind, scope) in held {
