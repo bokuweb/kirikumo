@@ -29,6 +29,9 @@ use serde_json::Value;
 /// How tall one line of YAML or of a log is.
 const LINE_HEIGHT: Pixels = px(17.);
 
+/// A log control row stays outside the virtualized log's paint bounds.
+const LOG_TOOLBAR_HEIGHT: Pixels = px(38.);
+
 /// The size the shell's text is drawn at.
 const SHELL_FONT_SIZE: Pixels = px(12.5);
 
@@ -2112,6 +2115,8 @@ impl Detail {
         let pod_picker = (indirect && !pods.is_empty()).then(|| {
             h_flex()
                 .w_full()
+                .h(LOG_TOOLBAR_HEIGHT)
+                .min_h(LOG_TOOLBAR_HEIGHT)
                 .px_3()
                 .pt_1p5()
                 .gap_1()
@@ -2169,11 +2174,14 @@ impl Detail {
 
         let controls = h_flex()
             .w_full()
+            .h(LOG_TOOLBAR_HEIGHT)
+            .min_h(LOG_TOOLBAR_HEIGHT)
             .px_3()
             .py_1p5()
             .gap_1()
             .flex_shrink_0()
             .items_center()
+            .overflow_x_scrollbar()
             .children(containers.into_iter().enumerate().map(|(index, name)| {
                 let selected = name == current;
                 let picked = name.clone();
@@ -2246,6 +2254,9 @@ impl Detail {
         let toolbar = v_flex()
             .w_full()
             .flex_shrink_0()
+            .bg(tokens.colors().bg_terminal)
+            .border_b_1()
+            .border_color(tokens.colors().border_subtle)
             .children(pod_picker)
             .child(controls);
 
@@ -2323,7 +2334,15 @@ impl Detail {
             .size_full()
             .bg(tokens.colors().bg_terminal)
             .child(toolbar)
-            .child(div().flex_1().min_h_0().w_full().child(body))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(body),
+            )
             .into_any_element()
     }
 

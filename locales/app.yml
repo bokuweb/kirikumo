@@ -180,8 +180,8 @@ detail.conditions:
   en: Conditions
   ja: 状態
 detail.events_empty:
-  en: No events
-  ja: イベントはありません
+  en: No recent events
+  ja: 最近のイベントはありません
 detail.resources_empty:
   en: Argo CD has not reported any managed resources.
   ja: Argo CD から管理対象リソースがまだ報告されていません。
