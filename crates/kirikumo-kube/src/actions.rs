@@ -1,17 +1,18 @@
 //! What can be done to an object, and what each thing becomes on the wire.
 //!
 //! The viewer's few writes (`docs/roadmap.md` M4): sync, delete, scale, restart,
-//! cordon and uncordon, and applying an edited manifest. Each is decided here
-//! — which kinds offer it, which RBAC verb it needs, what patch it is — so
-//! the rules can be tested without a window or a cluster, and so the view
-//! that draws the buttons holds no opinion about Kubernetes.
+//! trigger, suspend or resume a CronJob, cordon and uncordon, and apply an
+//! edited manifest. Each is decided here — which kinds offer it, which RBAC
+//! target and verb it needs, what patch or object it becomes — so the rules can
+//! be tested without a window or a cluster, and so the view that draws the
+//! buttons holds no opinion about Kubernetes.
 //!
 //! Every one of these is reached from the object it acts on and confirmed
 //! there, never from a key chord and never from the palette (`AGENTS.md`
 //! rule 9). This module does not know that; the views enforce it.
 
 use crate::error::{Error, Result};
-use crate::model::{ApiResource, Object, Patch};
+use crate::model::{ApiResource, Object, Patch, ResourceKey};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
@@ -20,10 +21,16 @@ use serde_json::{Value, json};
 pub enum Action {
     /// Ask an Argo CD Application to reconcile its configured revision.
     Sync,
+    /// Create one Job from a CronJob's template immediately.
+    Trigger,
     /// Change how many replicas a controller wants.
     Scale,
     /// Roll every pod of a controller, the way `kubectl rollout restart` does.
     Restart,
+    /// Stop a CronJob from creating scheduled Jobs.
+    Suspend,
+    /// Let a suspended CronJob create scheduled Jobs again.
+    Resume,
     /// Stop scheduling onto a node.
     Cordon,
     /// Schedule onto it again.
@@ -42,8 +49,11 @@ impl Action {
     /// ones first, and delete last where a hand does not fall on it.
     pub const ALL: &'static [Action] = &[
         Action::Sync,
+        Action::Trigger,
         Action::Scale,
         Action::Restart,
+        Action::Suspend,
+        Action::Resume,
         Action::Cordon,
         Action::Uncordon,
         Action::Drain,
@@ -55,12 +65,15 @@ impl Action {
     pub fn verb(self) -> &'static str {
         match self {
             Self::Delete => "delete",
+            Self::Trigger => "create",
             // A drain is a cordon and then evictions; the cordon is what
             // can be asked about up front. Whether each eviction is allowed
             // is answered by the apiserver, per pod, in the report.
             Self::Sync
             | Self::Scale
             | Self::Restart
+            | Self::Suspend
+            | Self::Resume
             | Self::Cordon
             | Self::Uncordon
             | Self::Drain => "patch",
@@ -72,8 +85,11 @@ impl Action {
     pub fn label_key(self) -> &'static str {
         match self {
             Self::Sync => "action.sync",
+            Self::Trigger => "action.trigger",
             Self::Scale => "action.scale",
             Self::Restart => "action.restart",
+            Self::Suspend => "action.suspend",
+            Self::Resume => "action.resume",
             Self::Cordon => "action.cordon",
             Self::Uncordon => "action.uncordon",
             Self::Drain => "action.drain",
@@ -87,6 +103,18 @@ impl Action {
     /// counts: it evicts every pod on the node.
     pub fn is_destructive(self) -> bool {
         matches!(self, Self::Delete | Self::Drain)
+    }
+
+    /// The kind whose permission controls this action.
+    ///
+    /// Most writes target the object being read. Trigger is deliberately the
+    /// exception: it reads a CronJob but creates a Job, so reviewing `patch`
+    /// on CronJobs would light a button this login still cannot use.
+    pub fn permission_target(self, object: &ResourceKey) -> ResourceKey {
+        match self {
+            Self::Trigger => ResourceKey::new("batch", "Job"),
+            _ => object.clone(),
+        }
     }
 }
 
@@ -102,6 +130,14 @@ pub fn available(resource: &ApiResource, object: &Object) -> Vec<Action> {
     let scalable = matches!(kind, "Deployment" | "StatefulSet" | "ReplicaSet");
     let restartable = matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet");
     let mut actions = Vec::new();
+    if resource.group == "batch"
+        && kind == "CronJob"
+        && object
+            .at("spec.jobTemplate.spec")
+            .is_some_and(Value::is_object)
+    {
+        actions.push(Action::Trigger);
+    }
     if resource.supports("patch") {
         let argo_application = resource.group == "argoproj.io" && kind == "Application";
         let operation = object.str_at("status.operationState.phase");
@@ -115,6 +151,12 @@ pub fn available(resource: &ApiResource, object: &Object) -> Vec<Action> {
         }
         if restartable {
             actions.push(Action::Restart);
+        }
+        if resource.group == "batch" && kind == "CronJob" {
+            actions.push(match object.bool_at("spec.suspend") {
+                true => Action::Resume,
+                false => Action::Suspend,
+            });
         }
         if kind == "Node" {
             actions.push(match object.bool_at("spec.unschedulable") {
@@ -159,6 +201,73 @@ pub fn restart(now: DateTime<Utc>) -> Patch {
         "spec": {"template": {"metadata": {"annotations": {
             "kubectl.kubernetes.io/restartedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         }}}}
+    }))
+}
+
+/// The patch that suspends a CronJob, or lets its schedule run again.
+pub fn suspended(suspend: bool) -> Patch {
+    Patch::Merge(json!({"spec": {"suspend": suspend}}))
+}
+
+/// Build the one-off Job sent when a CronJob is triggered manually.
+///
+/// This follows `kubectl create job --from=cronjob/...`: only the template's
+/// labels, annotations and Job spec are copied, the Job is marked as a manual
+/// instantiation, and the CronJob is its controller owner. `generateName`
+/// leaves naming and collision retries to the apiserver; the prefix is capped
+/// at 58 bytes so its five-character suffix still fits a Job's 63-character
+/// DNS label.
+pub fn manual_job(cron_job: &Object) -> Result<Value> {
+    if cron_job.str_at("kind") != "CronJob" || !cron_job.str_at("apiVersion").starts_with("batch/")
+    {
+        return Err(Error::Malformed(
+            "only a batch CronJob can be triggered".into(),
+        ));
+    }
+    let spec = cron_job
+        .at("spec.jobTemplate.spec")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| Error::Malformed("CronJob has no jobTemplate.spec".into()))?;
+    let namespace = cron_job
+        .meta
+        .namespace
+        .as_deref()
+        .filter(|namespace| !namespace.is_empty())
+        .ok_or_else(|| Error::Malformed("CronJob has no namespace".into()))?;
+    let mut annotations = cron_job
+        .at("spec.jobTemplate.metadata.annotations")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    annotations.insert(
+        "cronjob.kubernetes.io/instantiate".into(),
+        Value::String("manual".into()),
+    );
+    let labels = cron_job
+        .at("spec.jobTemplate.metadata.labels")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let base: String = cron_job.meta.name.chars().take(50).collect();
+    Ok(json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "generateName": format!("{base}-manual-"),
+            "namespace": namespace,
+            "labels": labels,
+            "annotations": annotations,
+            "ownerReferences": [{
+                "apiVersion": cron_job.str_at("apiVersion"),
+                "kind": "CronJob",
+                "name": cron_job.meta.name,
+                "uid": cron_job.meta.uid,
+                "controller": true,
+                "blockOwnerDeletion": true
+            }]
+        },
+        "spec": spec
     }))
 }
 
@@ -290,6 +399,133 @@ mod tests {
     }
 
     #[test]
+    fn a_cron_job_offers_suspend_or_resume_from_its_current_state() {
+        let mut cron_job = resource("CronJob", FULL);
+        cron_job.group = "batch".into();
+        let active = object(json!({
+            "spec": {
+                "suspend": false,
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{"name": "backup", "image": "busybox"}]
+                }}}}
+            }
+        }));
+        let suspended = object(json!({
+            "spec": {
+                "suspend": true,
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{"name": "backup", "image": "busybox"}]
+                }}}}
+            }
+        }));
+
+        assert_eq!(
+            available(&cron_job, &active),
+            vec![
+                Action::Trigger,
+                Action::Suspend,
+                Action::Apply,
+                Action::Delete
+            ]
+        );
+        assert_eq!(
+            available(&cron_job, &suspended),
+            vec![
+                Action::Trigger,
+                Action::Resume,
+                Action::Apply,
+                Action::Delete
+            ]
+        );
+    }
+
+    #[test]
+    fn trigger_reviews_create_on_jobs_not_patch_on_the_cron_job() {
+        let cron_job = ResourceKey::new("batch", "CronJob");
+        assert_eq!(Action::Trigger.verb(), "create");
+        assert_eq!(
+            Action::Trigger.permission_target(&cron_job),
+            ResourceKey::new("batch", "Job")
+        );
+        assert_eq!(Action::Suspend.permission_target(&cron_job), cron_job);
+    }
+
+    #[test]
+    fn a_manual_job_is_only_the_cron_jobs_template_and_safe_identity() {
+        let cron_job = object(json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "backup",
+                "namespace": "observability",
+                "uid": "cj-backup"
+            },
+            "spec": {"jobTemplate": {
+                "metadata": {
+                    "labels": {"app": "backup"},
+                    "annotations": {
+                        "example.com/note": "kept",
+                        "cronjob.kubernetes.io/instantiate": "scheduled"
+                    }
+                },
+                "spec": {"template": {"spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{"name": "backup", "image": "busybox"}]
+                }}}
+            }}
+        }));
+
+        let job = manual_job(&cron_job).unwrap();
+        assert_eq!(job["apiVersion"], "batch/v1");
+        assert_eq!(job["kind"], "Job");
+        assert_eq!(job["metadata"]["generateName"], "backup-manual-");
+        assert_eq!(job["metadata"]["namespace"], "observability");
+        assert_eq!(job["metadata"]["labels"]["app"], "backup");
+        assert_eq!(job["metadata"]["annotations"]["example.com/note"], "kept");
+        assert_eq!(
+            job["metadata"]["annotations"]["cronjob.kubernetes.io/instantiate"],
+            "manual"
+        );
+        assert_eq!(job["metadata"]["ownerReferences"][0]["uid"], "cj-backup");
+        assert_eq!(
+            job["spec"]["template"]["spec"]["containers"][0]["image"],
+            "busybox"
+        );
+        assert!(job.get("status").is_none());
+    }
+
+    #[test]
+    fn a_manual_jobs_generate_name_leaves_room_for_the_servers_suffix() {
+        let cron_job = object(json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+                "namespace": "default",
+                "uid": "long"
+            },
+            "spec": {"jobTemplate": {"spec": {}}}
+        }));
+        let job = manual_job(&cron_job).unwrap();
+        let prefix = job["metadata"]["generateName"].as_str().unwrap();
+        assert!(prefix.ends_with("-manual-"));
+        assert!(prefix.len() <= 58, "{prefix}");
+    }
+
+    #[test]
+    fn a_cron_job_without_a_job_template_cannot_be_triggered() {
+        let cron_job = object(json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {"name": "empty", "namespace": "default", "uid": "empty"},
+            "spec": {}
+        }));
+        assert!(manual_job(&cron_job).is_err());
+    }
+
+    #[test]
     fn only_an_idle_argo_application_offers_sync() {
         let mut application = resource("Application", FULL);
         application.group = "argoproj.io".into();
@@ -357,9 +593,12 @@ mod tests {
     #[test]
     fn each_action_names_the_verb_rbac_will_be_asked_about() {
         assert_eq!(Action::Delete.verb(), "delete");
+        assert_eq!(Action::Trigger.verb(), "create");
         assert_eq!(Action::Sync.verb(), "patch");
         assert_eq!(Action::Scale.verb(), "patch");
         assert_eq!(Action::Restart.verb(), "patch");
+        assert_eq!(Action::Suspend.verb(), "patch");
+        assert_eq!(Action::Resume.verb(), "patch");
         assert_eq!(Action::Cordon.verb(), "patch");
         assert_eq!(Action::Drain.verb(), "patch");
         assert_eq!(Action::Apply.verb(), "update");
@@ -373,6 +612,18 @@ mod tests {
             5
         );
         assert_eq!(current_replicas(&object(json!({"spec": {}}))), 1);
+    }
+
+    #[test]
+    fn suspending_and_resuming_only_change_the_cron_jobs_flag() {
+        assert_eq!(
+            suspended(true),
+            Patch::Merge(json!({"spec": {"suspend": true}}))
+        );
+        assert_eq!(
+            suspended(false),
+            Patch::Merge(json!({"spec": {"suspend": false}}))
+        );
     }
 
     #[test]

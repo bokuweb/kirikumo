@@ -16,7 +16,7 @@
 //! apiserver does, so the whole M4 flow — the two gestures, the request, the
 //! row changing under the reader — can be seen with no cluster to break.
 
-use crate::actions::merge_patch;
+use crate::actions::{self, merge_patch};
 use crate::error::{Error, Result};
 use crate::exec::{ExecOutput, ExecRequest};
 use crate::logs::LogStream;
@@ -105,7 +105,8 @@ impl Scripted {
             resource("", "v1", "Pod", "pods", true),
             resource("apps", "v1", "Deployment", "deployments", true),
             resource("apps", "v1", "ReplicaSet", "replicasets", true),
-            resource("batch", "v1", "CronJob", "cronjobs", true),
+            patchable(resource("batch", "v1", "CronJob", "cronjobs", true)),
+            createable(resource("batch", "v1", "Job", "jobs", true)),
             resource("", "v1", "ConfigMap", "configmaps", true),
             resource("", "v1", "Service", "services", true),
             resource(
@@ -114,6 +115,52 @@ impl Scripted {
                 "PersistentVolumeClaim",
                 "persistentvolumeclaims",
                 true,
+            ),
+            resource("", "v1", "PersistentVolume", "persistentvolumes", false),
+            resource(
+                "storage.k8s.io",
+                "v1",
+                "StorageClass",
+                "storageclasses",
+                false,
+            ),
+            resource("networking.k8s.io", "v1", "Ingress", "ingresses", true),
+            resource(
+                "networking.k8s.io",
+                "v1",
+                "NetworkPolicy",
+                "networkpolicies",
+                true,
+            ),
+            resource(
+                "autoscaling",
+                "v2",
+                "HorizontalPodAutoscaler",
+                "horizontalpodautoscalers",
+                true,
+            ),
+            resource("", "v1", "ServiceAccount", "serviceaccounts", true),
+            resource("rbac.authorization.k8s.io", "v1", "Role", "roles", true),
+            resource(
+                "rbac.authorization.k8s.io",
+                "v1",
+                "ClusterRole",
+                "clusterroles",
+                false,
+            ),
+            resource(
+                "rbac.authorization.k8s.io",
+                "v1",
+                "RoleBinding",
+                "rolebindings",
+                true,
+            ),
+            resource(
+                "rbac.authorization.k8s.io",
+                "v1",
+                "ClusterRoleBinding",
+                "clusterrolebindings",
+                false,
             ),
             patchable(resource(
                 "argoproj.io",
@@ -258,14 +305,31 @@ impl Scripted {
                     "apiVersion": "batch/v1", "kind": "CronJob",
                     "metadata": {"name": "backup", "namespace": "observability", "uid": "cj-backup",
                                  "creationTimestamp": ago(60 * 24 * 20)},
-                    "spec": {"schedule": "0 2 * * *", "suspend": false},
+                    "spec": {
+                        "schedule": "0 2 * * *",
+                        "suspend": false,
+                        "jobTemplate": {
+                            "metadata": {"labels": {"app": "backup"}},
+                            "spec": {"template": {"spec": {
+                                "restartPolicy": "Never",
+                                "containers": [{"name": "backup", "image": "ghcr.io/ops/backup:3"}]
+                            }}}
+                        }
+                    },
                     "status": {"lastScheduleTime": ago(700)}
                 }),
                 json!({
                     "apiVersion": "batch/v1", "kind": "CronJob",
                     "metadata": {"name": "reindex", "namespace": "shop", "uid": "cj-reindex",
                                  "creationTimestamp": ago(60 * 24 * 20)},
-                    "spec": {"schedule": "*/15 * * * *", "suspend": true},
+                    "spec": {
+                        "schedule": "*/15 * * * *",
+                        "suspend": true,
+                        "jobTemplate": {"spec": {"template": {"spec": {
+                            "restartPolicy": "Never",
+                            "containers": [{"name": "reindex", "image": "ghcr.io/shop/reindex:1"}]
+                        }}}}
+                    },
                     "status": {}
                 }),
             ]),
@@ -312,7 +376,8 @@ impl Scripted {
                     "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                     "metadata": {"name": "prometheus-data", "namespace": "observability",
                                  "uid": "pvc-prom", "creationTimestamp": ago(60 * 24 * 30)},
-                    "spec": {"storageClassName": "standard",
+                    "spec": {"storageClassName": "standard", "volumeName": "pvc-prometheus-data",
+                             "accessModes": ["ReadWriteOnce"], "volumeMode": "Filesystem",
                              "resources": {"requests": {"storage": "50Gi"}}},
                     "status": {"phase": "Bound", "capacity": {"storage": "50Gi"}}
                 }),
@@ -325,6 +390,126 @@ impl Scripted {
                     "status": {"phase": "Pending"}
                 }),
             ]),
+        );
+
+        objects.insert(
+            ResourceKey::new("", "PersistentVolume"),
+            parse(vec![json!({
+                "apiVersion": "v1", "kind": "PersistentVolume",
+                "metadata": {"name": "pvc-prometheus-data", "uid": "pv-prom",
+                             "creationTimestamp": ago(60 * 24 * 30)},
+                "spec": {"capacity": {"storage": "50Gi"},
+                         "accessModes": ["ReadWriteOnce"], "volumeMode": "Filesystem",
+                         "persistentVolumeReclaimPolicy": "Delete", "storageClassName": "standard",
+                         "claimRef": {"namespace": "observability", "name": "prometheus-data"},
+                         "csi": {"driver": "hostpath.csi.k8s.io", "volumeHandle": "prometheus-data"}},
+                "status": {"phase": "Bound"}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("storage.k8s.io", "StorageClass"),
+            parse(vec![json!({
+                "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
+                "metadata": {"name": "standard", "uid": "sc-standard",
+                             "creationTimestamp": ago(60 * 24 * 40)},
+                "provisioner": "hostpath.csi.k8s.io", "reclaimPolicy": "Delete",
+                "volumeBindingMode": "WaitForFirstConsumer", "allowVolumeExpansion": true,
+                "parameters": {"type": "hostpath"}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("networking.k8s.io", "Ingress"),
+            parse(vec![json!({
+                "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
+                "metadata": {"name": "shop", "namespace": "shop", "uid": "ing-shop",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "spec": {"ingressClassName": "nginx",
+                         "tls": [{"hosts": ["shop.example.com"], "secretName": "shop-tls"}],
+                         "rules": [{"host": "shop.example.com", "http": {"paths": [{
+                             "path": "/", "pathType": "Prefix",
+                             "backend": {"service": {"name": "web", "port": {"number": 443}}}
+                         }]}}]},
+                "status": {"loadBalancer": {"ingress": [{"ip": "203.0.113.10"}]}}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("networking.k8s.io", "NetworkPolicy"),
+            parse(vec![json!({
+                "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+                "metadata": {"name": "api", "namespace": "shop", "uid": "netpol-api",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "spec": {"podSelector": {"matchLabels": {"app": "api"}},
+                         "policyTypes": ["Ingress", "Egress"],
+                         "ingress": [{"from": [{"podSelector": {"matchLabels": {"app": "web"}}}],
+                                      "ports": [{"port": 8080, "protocol": "TCP"}]}],
+                         "egress": []}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("autoscaling", "HorizontalPodAutoscaler"),
+            parse(vec![json!({
+                "apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
+                "metadata": {"name": "api", "namespace": "shop", "uid": "hpa-api",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "spec": {"scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "api"},
+                         "minReplicas": 2, "maxReplicas": 10,
+                         "metrics": [{"type": "Resource", "resource": {"name": "cpu",
+                             "target": {"type": "Utilization", "averageUtilization": 70}}}]},
+                "status": {"currentReplicas": 2, "desiredReplicas": 3,
+                           "currentMetrics": [{"type": "Resource", "resource": {"name": "cpu",
+                               "current": {"averageUtilization": 82}}}]}
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("", "ServiceAccount"),
+            parse(vec![json!({
+                "apiVersion": "v1", "kind": "ServiceAccount",
+                "metadata": {"name": "api", "namespace": "shop", "uid": "sa-api",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "automountServiceAccountToken": false,
+                "imagePullSecrets": [{"name": "registry"}]
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("rbac.authorization.k8s.io", "Role"),
+            parse(vec![json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+                "metadata": {"name": "reader", "namespace": "shop", "uid": "role-reader",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "rules": [{"apiGroups": ["", "apps"], "resources": ["pods", "deployments"],
+                           "verbs": ["get", "list", "watch"]}]
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("rbac.authorization.k8s.io", "ClusterRole"),
+            parse(vec![json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+                "metadata": {"name": "namespace-reader", "uid": "clusterrole-reader",
+                             "creationTimestamp": ago(60 * 24 * 40)},
+                "rules": [{"apiGroups": [""], "resources": ["namespaces"], "verbs": ["get", "list"]}]
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("rbac.authorization.k8s.io", "RoleBinding"),
+            parse(vec![json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                "metadata": {"name": "api-readers", "namespace": "shop", "uid": "rb-api",
+                             "creationTimestamp": ago(60 * 24 * 12)},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "reader"},
+                "subjects": [{"kind": "ServiceAccount", "namespace": "shop", "name": "api"},
+                             {"kind": "Group", "name": "developers"}]
+            })]),
+        );
+        objects.insert(
+            ResourceKey::new("rbac.authorization.k8s.io", "ClusterRoleBinding"),
+            parse(vec![json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding",
+                "metadata": {"name": "namespace-readers", "uid": "crb-readers",
+                             "creationTimestamp": ago(60 * 24 * 40)},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole",
+                            "name": "namespace-reader"},
+                "subjects": [{"kind": "Group", "name": "developers"}]
+            })]),
         );
 
         // The CRD behind the custom resource below, with the columns its
@@ -771,6 +956,38 @@ impl Cluster for Scripted {
         Ok(updated)
     }
 
+    fn trigger_cron_job(&self, resource: &ApiResource, cron_job: &Object) -> Result<Object> {
+        if resource.group != "batch" || resource.kind != "CronJob" {
+            return Err(Error::Malformed(
+                "only a batch CronJob can be triggered".into(),
+            ));
+        }
+        let version = self.bump();
+        let mut raw = actions::manual_job(cron_job)?;
+        let prefix = raw
+            .pointer("/metadata/generateName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Malformed("manual Job has no generateName".into()))?;
+        let name = format!("{prefix}{version:0>5}");
+        let metadata = raw
+            .pointer_mut("/metadata")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::Malformed("manual Job has no metadata".into()))?;
+        metadata.remove("generateName");
+        metadata.insert("name".into(), json!(name));
+        metadata.insert("uid".into(), json!(format!("job-{version}")));
+        metadata.insert("resourceVersion".into(), json!(version));
+        metadata.insert("creationTimestamp".into(), json!(Utc::now().to_rfc3339()));
+        let created = Object::new(raw)?;
+        self.objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(ResourceKey::new("batch", "Job"))
+            .or_default()
+            .push(created.clone());
+        Ok(created)
+    }
+
     fn events_for(&self, uid: &str, _namespace: Option<&str>) -> Result<Vec<EventRecord>> {
         Ok(self.events.get(uid).cloned().unwrap_or_default())
     }
@@ -853,6 +1070,11 @@ fn resource(group: &str, version: &str, kind: &str, name: &str, namespaced: bool
 
 fn patchable(mut resource: ApiResource) -> ApiResource {
     resource.verbs.push("patch".into());
+    resource
+}
+
+fn createable(mut resource: ApiResource) -> ApiResource {
+    resource.verbs.push("create".into());
     resource
 }
 
@@ -1445,6 +1667,76 @@ mod tests {
             .unwrap();
         assert_eq!(synced.at("operation.sync"), Some(&json!({})));
         assert_eq!(synced.str_at("operation.initiatedBy.username"), "kirikumo");
+    }
+
+    #[test]
+    fn a_sample_cron_job_suspends_and_resumes_through_the_real_patch_path() {
+        let cluster = Scripted::sample();
+        let cron_jobs = resource_for(&cluster, "batch", "CronJob");
+
+        let suspended = cluster
+            .patch(
+                &cron_jobs,
+                Some("observability"),
+                "backup",
+                crate::actions::suspended(true),
+            )
+            .unwrap();
+        assert!(suspended.bool_at("spec.suspend"));
+        assert!(
+            crate::actions::available(&cron_jobs, &suspended)
+                .contains(&crate::actions::Action::Resume)
+        );
+
+        let resumed = cluster
+            .patch(
+                &cron_jobs,
+                Some("observability"),
+                "backup",
+                crate::actions::suspended(false),
+            )
+            .unwrap();
+        assert!(!resumed.bool_at("spec.suspend"));
+        assert!(
+            crate::actions::available(&cron_jobs, &resumed)
+                .contains(&crate::actions::Action::Suspend)
+        );
+    }
+
+    #[test]
+    fn a_sample_cron_job_triggers_a_real_job_from_its_template() {
+        let cluster = Scripted::sample();
+        let cron_jobs = resource_for(&cluster, "batch", "CronJob");
+        let jobs = resource_for(&cluster, "batch", "Job");
+        let cron_job = cluster
+            .get(&cron_jobs, Some("observability"), "backup")
+            .unwrap();
+
+        let created = cluster.trigger_cron_job(&cron_jobs, &cron_job).unwrap();
+
+        assert!(created.meta.name.starts_with("backup-manual-"));
+        assert_eq!(created.meta.namespace.as_deref(), Some("observability"));
+        assert_eq!(
+            created
+                .raw
+                .pointer("/metadata/annotations/cronjob.kubernetes.io~1instantiate")
+                .and_then(Value::as_str),
+            Some("manual")
+        );
+        assert_eq!(created.str_at("spec.template.spec.restartPolicy"), "Never");
+        assert!(
+            cluster
+                .get(&jobs, Some("observability"), &created.meta.name)
+                .is_ok()
+        );
+        assert_eq!(
+            cluster
+                .list(&jobs, Some("observability"))
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
     }
 
     #[test]

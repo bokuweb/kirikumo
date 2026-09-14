@@ -141,6 +141,15 @@ pub trait Cluster: Send + Sync {
         Err(Error::Unsupported)
     }
 
+    /// Create one Job immediately from a CronJob's job template.
+    ///
+    /// Narrow by design: Kirikumo is not a generic object-authoring client,
+    /// and the permission for this operation is `create` on `batch/Job`, not
+    /// a write permission on the CronJob being read.
+    fn trigger_cron_job(&self, _resource: &ApiResource, _cron_job: &Object) -> Result<Object> {
+        Err(Error::Unsupported)
+    }
+
     /// Open one connection to a port on a pod.
     ///
     /// Called once per local connection by [`portforward::Forwarder`], on

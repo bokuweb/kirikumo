@@ -35,14 +35,16 @@ pub type ObjectKey = (ResourceKey, Option<String>, String);
 /// A write, ready to send.
 ///
 /// Built by the detail panel from `kirikumo_kube::actions` and carried here
-/// whole, so the store knows nothing about *why* — only that it is a delete
-/// or a patch, which is all the trait knows either.
+/// whole, so the store knows only the narrow operation the trait exposes and
+/// not how the button that requested it was presented.
 #[derive(Debug, Clone)]
 pub enum Write {
     /// Remove the object.
     Delete,
     /// Change it.
     Patch(Patch),
+    /// Create one Job from this CronJob's template.
+    TriggerCronJob(Object),
     /// Cordon the node and move everything off it that can move.
     Drain,
 }
@@ -780,8 +782,63 @@ impl Store {
         }
     }
 
+    /// Refresh metrics that have previously succeeded, keeping their stale
+    /// values on screen while the next sample is fetched.
+    ///
+    /// An unsupported metrics API is deliberately not retried on this clock;
+    /// only a successful first answer opts a scope into periodic sampling.
+    pub fn refresh_metrics_if_available(
+        &mut self,
+        kind: &str,
+        namespace: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        match kind {
+            "Node" if self.node_metrics.value().is_some() && !self.node_metrics.is_loading() => {
+                self.node_metrics.begin();
+                self.fetch(
+                    cx,
+                    |cluster| cluster.node_metrics(),
+                    |this, result, _| this.node_metrics.finish(result),
+                );
+            }
+            "Pod" => {
+                let scope = namespace.map(str::to_string);
+                let refresh = self
+                    .pod_metrics
+                    .get(&scope)
+                    .is_some_and(|fetch| fetch.value().is_some() && !fetch.is_loading());
+                if !refresh {
+                    return;
+                }
+                self.pod_metrics.entry(scope.clone()).or_default().begin();
+                let asked = scope.clone();
+                self.fetch(
+                    cx,
+                    move |cluster| cluster.pod_metrics(asked.as_deref()),
+                    move |this, result, _| {
+                        this.pod_metrics.entry(scope).or_default().finish(result);
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// What one object is using, if anything has said.
     pub fn metrics_for(&self, kind: &str, namespace: Option<&str>, name: &str) -> Option<&Metrics> {
+        self.metrics(kind, namespace)?
+            .iter()
+            .find(|metrics| metrics.name == name)
+    }
+
+    /// Every metric in one table scope after the optional API answered.
+    ///
+    /// `Some(&[])` means the metrics API exists but the scope is empty;
+    /// `None` also covers loading and unsupported clusters. That distinction
+    /// lets the table add usage columns only when the cluster can populate
+    /// them.
+    pub fn metrics(&self, kind: &str, namespace: Option<&str>) -> Option<&[Metrics]> {
         let held = match kind {
             "Node" => self.node_metrics.value()?,
             "Pod" => self
@@ -790,7 +847,7 @@ impl Store {
                 .value()?,
             _ => return None,
         };
-        held.iter().find(|metrics| metrics.name == name)
+        Some(held.as_slice())
     }
 
     /// Whether this login may do a verb on a kind, if the cluster has said.
@@ -869,6 +926,7 @@ impl Store {
         // catalogue can say.
         let pods = self.resource(&drain::pods_key()).cloned();
         let drained = matches!(write, Write::Drain);
+        let triggered = matches!(write, Write::TriggerCronJob(_));
         self.fetch(
             cx,
             move |cluster| match write {
@@ -878,6 +936,9 @@ impl Store {
                 Write::Patch(patch) => cluster
                     .patch(&resource, scope.as_deref(), &name, patch)
                     .map(|_| String::new()),
+                Write::TriggerCronJob(cron_job) => cluster
+                    .trigger_cron_job(&resource, &cron_job)
+                    .map(|job| rust_i18n::t!("action.triggered", name = job.meta.name).to_string()),
                 Write::Drain => {
                     let pods = pods.ok_or(kirikumo_kube::Error::Unsupported)?;
                     // Slow on purpose when a budget resists; this is the
@@ -896,10 +957,15 @@ impl Store {
                     // moved pods as well as touching the node, so their
                     // lists are asked for too.
                     let pods = drain::pods_key();
+                    let jobs = ResourceKey::new("batch", "Job");
                     let held: Vec<ListKey> = this
                         .lists
                         .keys()
-                        .filter(|(kind, _)| *kind == key || (drained && *kind == pods))
+                        .filter(|(kind, _)| {
+                            *kind == key
+                                || (drained && *kind == pods)
+                                || (triggered && *kind == jobs)
+                        })
                         .cloned()
                         .collect();
                     for (kind, scope) in held {

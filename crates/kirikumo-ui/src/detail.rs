@@ -307,6 +307,14 @@ pub fn overview_for(
         }
         "Service" => sections.extend(service(object)),
         "PersistentVolumeClaim" => sections.extend(claim(object)),
+        "PersistentVolume" => sections.extend(volume(object)),
+        "StorageClass" => sections.extend(storage_class(object)),
+        "Ingress" => sections.extend(ingress(object)),
+        "NetworkPolicy" => sections.extend(network_policy(object)),
+        "HorizontalPodAutoscaler" => sections.extend(horizontal_pod_autoscaler(object)),
+        "ServiceAccount" => sections.extend(service_account(object)),
+        "Role" | "ClusterRole" => sections.extend(rbac_role(object)),
+        "RoleBinding" | "ClusterRoleBinding" => sections.extend(rbac_binding(object)),
         "ConfigMap" | "Secret" => sections.extend(keys(object)),
         _ => {}
     }
@@ -781,7 +789,14 @@ fn service(object: &Object) -> Vec<Section> {
 fn claim(object: &Object) -> Vec<Section> {
     let mut facts = Vec::new();
     push_text(&mut facts, "Phase", object.str_at("status.phase"));
-    push_id(&mut facts, "Volume", object.str_at("spec.volumeName"));
+    let volume = object.str_at("spec.volumeName");
+    if !volume.is_empty() {
+        facts.push(Fact::id("Volume", volume).to(Target::Object {
+            key: ResourceKey::new("", "PersistentVolume"),
+            namespace: None,
+            name: volume.into(),
+        }));
+    }
     push_text(
         &mut facts,
         "Storage class",
@@ -805,10 +820,426 @@ fn claim(object: &Object) -> Vec<Section> {
     if !modes.is_empty() {
         facts.push(Fact::text("Access modes", modes.join(", ")));
     }
+    push_text(&mut facts, "Volume mode", object.str_at("spec.volumeMode"));
+    let source_kind = object.str_at("spec.dataSource.kind");
+    let source_name = object.str_at("spec.dataSource.name");
+    if !source_kind.is_empty() && !source_name.is_empty() {
+        facts.push(Fact::id(
+            "Data source",
+            format!("{source_kind}/{source_name}"),
+        ));
+    }
     vec![Section {
         title: Some("Claim".into()),
         facts,
     }]
+}
+
+/// A persistent volume's binding, lifecycle and storage implementation.
+fn volume(object: &Object) -> Vec<Section> {
+    let mut facts = Vec::new();
+    push_text(&mut facts, "Phase", object.str_at("status.phase"));
+    push_id(
+        &mut facts,
+        "Capacity",
+        object.str_at("spec.capacity.storage"),
+    );
+    push_text(
+        &mut facts,
+        "Storage class",
+        object.str_at("spec.storageClassName"),
+    );
+    push_text(
+        &mut facts,
+        "Reclaim policy",
+        object.str_at("spec.persistentVolumeReclaimPolicy"),
+    );
+    push_text(&mut facts, "Volume mode", object.str_at("spec.volumeMode"));
+    let modes = string_array(object.at("spec.accessModes"));
+    push_text(&mut facts, "Access modes", &modes.join(", "));
+
+    let claim_namespace = object.str_at("spec.claimRef.namespace");
+    let claim_name = object.str_at("spec.claimRef.name");
+    if !claim_name.is_empty() {
+        let value = match claim_namespace.is_empty() {
+            true => claim_name.to_string(),
+            false => format!("{claim_namespace}/{claim_name}"),
+        };
+        facts.push(Fact::id("Claim", value).to(Target::Object {
+            key: ResourceKey::new("", "PersistentVolumeClaim"),
+            namespace: (!claim_namespace.is_empty()).then(|| claim_namespace.to_string()),
+            name: claim_name.to_string(),
+        }));
+    }
+    push_id(&mut facts, "CSI driver", object.str_at("spec.csi.driver"));
+    push_id(
+        &mut facts,
+        "Volume handle",
+        object.str_at("spec.csi.volumeHandle"),
+    );
+    nonempty_section("Volume", facts)
+}
+
+/// A storage class's dynamic-provisioning policy.
+fn storage_class(object: &Object) -> Vec<Section> {
+    let mut facts = Vec::new();
+    push_id(&mut facts, "Provisioner", object.str_at("provisioner"));
+    push_text(&mut facts, "Reclaim policy", object.str_at("reclaimPolicy"));
+    push_text(
+        &mut facts,
+        "Binding mode",
+        object.str_at("volumeBindingMode"),
+    );
+    if object.at("allowVolumeExpansion").is_some() {
+        facts.push(Fact::text(
+            "Volume expansion",
+            if object.bool_at("allowVolumeExpansion") {
+                "Allowed"
+            } else {
+                "Disabled"
+            },
+        ));
+    }
+    push_text(
+        &mut facts,
+        "Mount options",
+        &string_array(object.at("mountOptions")).join(", "),
+    );
+    if let Some(parameters) = object.at("parameters").and_then(Value::as_object) {
+        let mut rendered = parameters
+            .iter()
+            .map(|(key, value)| format!("{key}={}", scalar(value)))
+            .collect::<Vec<_>>();
+        rendered.sort();
+        let rendered = rendered.join("\n");
+        push_id(&mut facts, "Parameters", &rendered);
+    }
+    nonempty_section("Storage class", facts)
+}
+
+/// An ingress's externally reachable addresses and HTTP routing rules.
+fn ingress(object: &Object) -> Vec<Section> {
+    let mut facts = Vec::new();
+    push_text(&mut facts, "Class", object.str_at("spec.ingressClassName"));
+    let addresses = object
+        .array_at("status.loadBalancer.ingress")
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("ip")
+                .or_else(|| entry.get("hostname"))
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    push_id(&mut facts, "Addresses", &addresses);
+
+    let mut routes = Vec::new();
+    for rule in object.array_at("spec.rules") {
+        let host = rule.get("host").and_then(Value::as_str).unwrap_or("*");
+        for path in rule
+            .pointer("/http/paths")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let route = path.get("path").and_then(Value::as_str).unwrap_or("/");
+            let backend = path.get("backend").unwrap_or(&Value::Null);
+            let service = backend
+                .pointer("/service/name")
+                .or_else(|| backend.get("serviceName"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let port = backend
+                .pointer("/service/port/number")
+                .or_else(|| backend.pointer("/service/port/name"))
+                .or_else(|| backend.get("servicePort"))
+                .map(scalar)
+                .unwrap_or_default();
+            let destination = match port.is_empty() {
+                true => format!("Service/{service}"),
+                false => format!("Service/{service}:{port}"),
+            };
+            routes.push(format!("{host}{route} → {destination}"));
+        }
+    }
+    push_id(&mut facts, "Routes", &routes.join("\n"));
+
+    let tls = object
+        .array_at("spec.tls")
+        .iter()
+        .map(|entry| {
+            let hosts = string_array(entry.get("hosts")).join(", ");
+            let secret = entry
+                .get("secretName")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match (hosts.is_empty(), secret.is_empty()) {
+                (false, false) => format!("{hosts} · {secret}"),
+                (false, true) => hosts,
+                (true, false) => secret.to_string(),
+                (true, true) => String::new(),
+            }
+        })
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    push_id(&mut facts, "TLS", &tls);
+    nonempty_section("Ingress", facts)
+}
+
+/// A network policy's selected pods and whether each direction is isolated.
+fn network_policy(object: &Object) -> Vec<Section> {
+    let mut facts = Vec::new();
+    let selector = label_selector(object.at("spec.podSelector"));
+    if !selector.is_empty() {
+        facts.push(
+            Fact::id("Pod selector", selector.clone()).to(Target::Filtered {
+                key: ResourceKey::new("", "Pod"),
+                namespace: object.meta.namespace.clone(),
+                query: first_label(&selector),
+            }),
+        );
+    } else if object.at("spec.podSelector").is_some() {
+        facts.push(Fact::text("Pod selector", "All pods"));
+    }
+    let policy_types = string_array(object.at("spec.policyTypes"));
+    push_text(&mut facts, "Policy types", &policy_types.join(", "));
+    for (label, path, policy_type) in [
+        ("Ingress rules", "spec.ingress", "Ingress"),
+        ("Egress rules", "spec.egress", "Egress"),
+    ] {
+        if policy_types.iter().any(|kind| kind == policy_type) || object.at(path).is_some() {
+            let count = object.array_at(path).len();
+            facts.push(Fact::text(
+                label,
+                match count {
+                    0 => "0 (deny all)".to_string(),
+                    count => count.to_string(),
+                },
+            ));
+        }
+    }
+    nonempty_section("Network policy", facts)
+}
+
+/// An HPA's scale target, replica envelope and resource-metric progress.
+fn horizontal_pod_autoscaler(object: &Object) -> Vec<Section> {
+    let mut facts = Vec::new();
+    let target_kind = object.str_at("spec.scaleTargetRef.kind");
+    let target_name = object.str_at("spec.scaleTargetRef.name");
+    if !target_kind.is_empty() && !target_name.is_empty() {
+        let api_version = object.str_at("spec.scaleTargetRef.apiVersion");
+        let group = api_version
+            .split_once('/')
+            .map(|(group, _)| group)
+            .unwrap_or("");
+        facts.push(
+            Fact::id("Target", format!("{target_kind}/{target_name}")).to(Target::Object {
+                key: ResourceKey::new(group, target_kind),
+                namespace: object.meta.namespace.clone(),
+                name: target_name.to_string(),
+            }),
+        );
+    }
+    let min = object.int_at("spec.minReplicas").max(1);
+    let max = object.int_at("spec.maxReplicas");
+    let current = object.int_at("status.currentReplicas");
+    let desired = object.int_at("status.desiredReplicas");
+    if max > 0 {
+        facts.push(Fact::text(
+            "Replicas",
+            format!("{current} current · {desired} desired · {min}–{max} allowed"),
+        ));
+    }
+    let metrics = hpa_metrics(object);
+    push_text(&mut facts, "Metrics", &metrics.join("\n"));
+    nonempty_section("Autoscaling", facts)
+}
+
+fn hpa_metrics(object: &Object) -> Vec<String> {
+    let current_metrics = object.array_at("status.currentMetrics");
+    object
+        .array_at("spec.metrics")
+        .iter()
+        .enumerate()
+        .map(|(index, metric)| {
+            let kind = metric
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("Metric");
+            if kind != "Resource" {
+                return kind.to_string();
+            }
+            let name = metric
+                .pointer("/resource/name")
+                .and_then(Value::as_str)
+                .unwrap_or("resource");
+            let target = metric
+                .pointer("/resource/target/averageUtilization")
+                .map(scalar)
+                .map(|value| format!("{value}%"))
+                .or_else(|| metric.pointer("/resource/target/averageValue").map(scalar))
+                .unwrap_or_else(|| "?".into());
+            let current_metric = current_metrics.get(index);
+            let current = current_metric
+                .and_then(|metric| metric.pointer("/resource/current/averageUtilization"))
+                .map(scalar)
+                .map(|value| format!("{value}%"))
+                .or_else(|| {
+                    current_metric
+                        .and_then(|metric| metric.pointer("/resource/current/averageValue"))
+                        .map(scalar)
+                })
+                .unwrap_or_else(|| "?".into());
+            format!("{name} {current} / {target}")
+        })
+        .collect()
+}
+
+/// Service-account settings and reference names, never referenced values.
+fn service_account(object: &Object) -> Vec<Section> {
+    let mut facts = Vec::new();
+    if object.at("automountServiceAccountToken").is_some() {
+        facts.push(Fact::text(
+            "Automount token",
+            if object.bool_at("automountServiceAccountToken") {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+        ));
+    }
+    push_id(
+        &mut facts,
+        "Secrets",
+        &named_references(object.at("secrets")).join("\n"),
+    );
+    push_id(
+        &mut facts,
+        "Image pull secrets",
+        &named_references(object.at("imagePullSecrets")).join("\n"),
+    );
+    nonempty_section("Service account", facts)
+}
+
+/// A Role or ClusterRole's effective rule summaries.
+fn rbac_role(object: &Object) -> Vec<Section> {
+    let facts = object
+        .array_at("rules")
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            let verbs = string_array(rule.get("verbs")).join(", ");
+            let groups = string_array(rule.get("apiGroups"))
+                .into_iter()
+                .map(|group| {
+                    if group.is_empty() {
+                        "core".into()
+                    } else {
+                        group
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut targets = string_array(rule.get("resources"));
+            targets.extend(string_array(rule.get("nonResourceURLs")));
+            Fact::id(
+                format!("Rule {}", index + 1),
+                format!("{verbs} · {groups} · {}", targets.join(", ")),
+            )
+        })
+        .collect();
+    nonempty_section("Permissions", facts)
+}
+
+/// A role binding's role and subjects.
+fn rbac_binding(object: &Object) -> Vec<Section> {
+    let mut facts = Vec::new();
+    let role_kind = object.str_at("roleRef.kind");
+    let role_name = object.str_at("roleRef.name");
+    if !role_kind.is_empty() && !role_name.is_empty() {
+        facts.push(
+            Fact::id("Role", format!("{role_kind}/{role_name}")).to(Target::Object {
+                key: ResourceKey::new("rbac.authorization.k8s.io", role_kind),
+                namespace: (role_kind == "Role")
+                    .then(|| object.meta.namespace.clone())
+                    .flatten(),
+                name: role_name.to_string(),
+            }),
+        );
+    }
+    let subjects = object
+        .array_at("subjects")
+        .iter()
+        .filter_map(|subject| {
+            let kind = subject.get("kind").and_then(Value::as_str)?;
+            let name = subject.get("name").and_then(Value::as_str)?;
+            let namespace = subject
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|namespace| !namespace.is_empty());
+            Some(match namespace {
+                Some(namespace) => format!("{kind}/{namespace}/{name}"),
+                None => format!("{kind}/{name}"),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    push_id(&mut facts, "Subjects", &subjects);
+    nonempty_section("Binding", facts)
+}
+
+fn named_references(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|reference| reference.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn label_selector(value: Option<&Value>) -> String {
+    value
+        .and_then(|selector| selector.get("matchLabels"))
+        .and_then(Value::as_object)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|(key, value)| Some(format!("{key}={}", value.as_str()?)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn scalar(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn nonempty_section(title: &str, facts: Vec<Fact>) -> Vec<Section> {
+    match facts.is_empty() {
+        true => Vec::new(),
+        false => vec![Section {
+            title: Some(title.into()),
+            facts,
+        }],
+    }
 }
 
 /// A ConfigMap's or a Secret's keys.
@@ -1401,6 +1832,209 @@ mod tests {
             linked(&overview, "Selector").link,
             Some(Target::Filtered { .. })
         ));
+    }
+
+    #[test]
+    fn storage_resources_explain_binding_and_provisioning() {
+        let volume = overview(
+            "PersistentVolume",
+            &object(json!({
+                "metadata": {"name": "pvc-123"},
+                "spec": {
+                    "capacity": {"storage": "50Gi"},
+                    "accessModes": ["ReadWriteOnce"],
+                    "persistentVolumeReclaimPolicy": "Delete",
+                    "storageClassName": "fast",
+                    "volumeMode": "Filesystem",
+                    "claimRef": {"namespace": "shop", "name": "data"},
+                    "csi": {"driver": "disk.csi.example.io", "volumeHandle": "disk-42"}
+                },
+                "status": {"phase": "Bound"}
+            })),
+            None,
+            now(),
+        );
+        let volume_facts = facts(&volume);
+        assert!(volume_facts.contains(&("Phase", "Bound")));
+        assert!(volume_facts.contains(&("Capacity", "50Gi")));
+        assert!(volume_facts.contains(&("Claim", "shop/data")));
+        assert!(volume_facts.contains(&("Reclaim policy", "Delete")));
+        assert!(volume_facts.contains(&("CSI driver", "disk.csi.example.io")));
+        assert_eq!(
+            linked(&volume, "Claim").link,
+            Some(Target::Object {
+                key: ResourceKey::new("", "PersistentVolumeClaim"),
+                namespace: Some("shop".into()),
+                name: "data".into(),
+            })
+        );
+
+        let class = overview(
+            "StorageClass",
+            &object(json!({
+                "metadata": {"name": "fast"},
+                "provisioner": "disk.csi.example.io",
+                "reclaimPolicy": "Delete",
+                "volumeBindingMode": "WaitForFirstConsumer",
+                "allowVolumeExpansion": true,
+                "mountOptions": ["discard"],
+                "parameters": {"type": "ssd", "encrypted": "true"}
+            })),
+            None,
+            now(),
+        );
+        let class_facts = facts(&class);
+        assert!(class_facts.contains(&("Provisioner", "disk.csi.example.io")));
+        assert!(class_facts.contains(&("Binding mode", "WaitForFirstConsumer")));
+        assert!(class_facts.contains(&("Volume expansion", "Allowed")));
+        assert!(class_facts.contains(&("Parameters", "encrypted=true\ntype=ssd")));
+    }
+
+    #[test]
+    fn networking_resources_summarise_routes_and_policy_scope() {
+        let ingress = overview(
+            "Ingress",
+            &object(json!({
+                "metadata": {"name": "shop", "namespace": "shop"},
+                "spec": {
+                    "ingressClassName": "nginx",
+                    "tls": [{"hosts": ["shop.example.com"], "secretName": "shop-tls"}],
+                    "rules": [{"host": "shop.example.com", "http": {"paths": [
+                        {"path": "/", "pathType": "Prefix", "backend": {"service": {
+                            "name": "web", "port": {"number": 80}
+                        }}}
+                    ]}}]
+                },
+                "status": {"loadBalancer": {"ingress": [{"ip": "203.0.113.10"}]}}
+            })),
+            None,
+            now(),
+        );
+        let ingress_facts = facts(&ingress);
+        assert!(ingress_facts.contains(&("Class", "nginx")));
+        assert!(ingress_facts.contains(&("Addresses", "203.0.113.10")));
+        assert!(ingress_facts.contains(&("Routes", "shop.example.com/ → Service/web:80")));
+        assert!(ingress_facts.contains(&("TLS", "shop.example.com · shop-tls")));
+
+        let policy = overview(
+            "NetworkPolicy",
+            &object(json!({
+                "metadata": {"name": "api", "namespace": "shop"},
+                "spec": {
+                    "podSelector": {"matchLabels": {"app": "api"}},
+                    "policyTypes": ["Ingress", "Egress"],
+                    "ingress": [{"from": [{"namespaceSelector": {}}], "ports": [{"port": 8080}]}],
+                    "egress": []
+                }
+            })),
+            None,
+            now(),
+        );
+        let policy_facts = facts(&policy);
+        assert!(policy_facts.contains(&("Pod selector", "app=api")));
+        assert!(policy_facts.contains(&("Policy types", "Ingress, Egress")));
+        assert!(policy_facts.contains(&("Ingress rules", "1")));
+        assert!(policy_facts.contains(&("Egress rules", "0 (deny all)")));
+        assert!(matches!(
+            linked(&policy, "Pod selector").link,
+            Some(Target::Filtered { .. })
+        ));
+    }
+
+    #[test]
+    fn an_hpa_explains_its_target_replicas_and_metrics() {
+        let overview = overview_for(
+            &ResourceKey::new("autoscaling", "HorizontalPodAutoscaler"),
+            &object(json!({
+                "metadata": {"name": "api", "namespace": "shop"},
+                "spec": {
+                    "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "api"},
+                    "minReplicas": 2,
+                    "maxReplicas": 10,
+                    "metrics": [{"type": "Resource", "resource": {
+                        "name": "cpu", "target": {"type": "Utilization", "averageUtilization": 70}
+                    }}]
+                },
+                "status": {"currentReplicas": 3, "desiredReplicas": 4,
+                           "currentMetrics": [{"type": "Resource", "resource": {
+                               "name": "cpu", "current": {"averageUtilization": 82}
+                           }}]}
+            })),
+            None,
+            now(),
+        );
+        let facts = facts(&overview);
+        assert!(facts.contains(&("Target", "Deployment/api")));
+        assert!(facts.contains(&("Replicas", "3 current · 4 desired · 2–10 allowed")));
+        assert!(facts.contains(&("Metrics", "cpu 82% / 70%")));
+        assert_eq!(
+            linked(&overview, "Target").link,
+            Some(Target::Object {
+                key: ResourceKey::new("apps", "Deployment"),
+                namespace: Some("shop".into()),
+                name: "api".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rbac_resources_show_rules_bindings_and_safe_account_references() {
+        let role = overview_for(
+            &ResourceKey::new("rbac.authorization.k8s.io", "Role"),
+            &object(json!({
+                "metadata": {"name": "reader", "namespace": "shop"},
+                "rules": [{"apiGroups": ["", "apps"], "resources": ["pods", "deployments"],
+                           "verbs": ["get", "list", "watch"]}]
+            })),
+            None,
+            now(),
+        );
+        assert!(facts(&role).contains(&(
+            "Rule 1",
+            "get, list, watch · core, apps · pods, deployments"
+        )));
+
+        let binding = overview_for(
+            &ResourceKey::new("rbac.authorization.k8s.io", "RoleBinding"),
+            &object(json!({
+                "metadata": {"name": "readers", "namespace": "shop"},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "reader"},
+                "subjects": [
+                    {"kind": "ServiceAccount", "namespace": "shop", "name": "api"},
+                    {"kind": "Group", "name": "developers"}
+                ]
+            })),
+            None,
+            now(),
+        );
+        assert!(facts(&binding).contains(&("Role", "Role/reader")));
+        assert!(
+            facts(&binding).contains(&("Subjects", "ServiceAccount/shop/api\nGroup/developers"))
+        );
+        assert_eq!(
+            linked(&binding, "Role").link,
+            Some(Target::Object {
+                key: ResourceKey::new("rbac.authorization.k8s.io", "Role"),
+                namespace: Some("shop".into()),
+                name: "reader".into(),
+            })
+        );
+
+        let account = overview(
+            "ServiceAccount",
+            &object(json!({
+                "metadata": {"name": "api", "namespace": "shop"},
+                "automountServiceAccountToken": false,
+                "secrets": [{"name": "api-token"}],
+                "imagePullSecrets": [{"name": "registry"}]
+            })),
+            None,
+            now(),
+        );
+        let facts = facts(&account);
+        assert!(facts.contains(&("Automount token", "Disabled")));
+        assert!(facts.contains(&("Secrets", "api-token")));
+        assert!(facts.contains(&("Image pull secrets", "registry")));
     }
 
     #[test]

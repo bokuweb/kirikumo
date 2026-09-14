@@ -5,7 +5,7 @@
 //! wire is the wire, and the parts that can only be wrong against a real
 //! apiserver are the ones this file exercises: discovery, a list, a watch
 //! that sees a real change, a log, a port-forward carrying real HTTP, the
-//! access review, and the writes.
+//! access review, and the writes, including creating a Job from a CronJob.
 //!
 //! Ignored by default. Run with a cluster in the kubeconfig that you do not
 //! mind writing to — a `kind` cluster is the intended one — and a namespace
@@ -417,6 +417,54 @@ fn the_access_review_answers_and_a_scale_lands() {
                 .at("spec.template.metadata.annotations")
                 .is_some_and(|a| a.get("kubectl.kubernetes.io/restartedAt").is_some())
     );
+}
+
+#[test]
+#[ignore = "needs a live cluster"]
+fn a_cron_job_can_be_triggered_into_a_real_job() {
+    let cluster = connect();
+    let namespace = namespace();
+    let cron_jobs = resource(&cluster, "batch", "CronJob");
+    let jobs = resource(&cluster, "batch", "Job");
+    assert!(
+        cluster
+            .can_i(&jobs, Some(&namespace), "create")
+            .expect("review")
+    );
+
+    let name = format!("kirikumo-trigger-{}", std::process::id());
+    let status = std::process::Command::new("kubectl")
+        .args([
+            "-n",
+            &namespace,
+            "create",
+            "cronjob",
+            &name,
+            "--image=busybox",
+            "--schedule=0 0 1 1 *",
+            "--",
+            "echo",
+            "kirikumo",
+        ])
+        .status()
+        .expect("kubectl");
+    assert!(status.success(), "kubectl create cronjob");
+
+    let cron_job = cluster
+        .get(&cron_jobs, Some(&namespace), &name)
+        .expect("get cronjob");
+    let job = cluster
+        .trigger_cron_job(&cron_jobs, &cron_job)
+        .expect("trigger");
+    assert!(job.meta.name.starts_with(&format!("{name}-manual-")));
+    assert_eq!(job.str_at("metadata.ownerReferences.0.name"), name);
+
+    cluster
+        .delete(&jobs, Some(&namespace), &job.meta.name)
+        .expect("delete job");
+    cluster
+        .delete(&cron_jobs, Some(&namespace), &name)
+        .expect("delete cronjob");
 }
 
 #[test]

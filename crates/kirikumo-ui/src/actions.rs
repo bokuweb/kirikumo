@@ -94,6 +94,7 @@ pub fn parse_replicas(text: &str) -> Option<u32> {
 pub fn confirm_label(action: Action, name: &str, replicas: Option<u32>) -> String {
     match action {
         Action::Sync => rust_i18n::t!("action.confirm.sync", name = name).to_string(),
+        Action::Trigger => rust_i18n::t!("action.confirm.trigger", name = name).to_string(),
         Action::Scale => rust_i18n::t!(
             "action.confirm.scale",
             name = name,
@@ -101,6 +102,8 @@ pub fn confirm_label(action: Action, name: &str, replicas: Option<u32>) -> Strin
         )
         .to_string(),
         Action::Restart => rust_i18n::t!("action.confirm.restart", name = name).to_string(),
+        Action::Suspend => rust_i18n::t!("action.confirm.suspend", name = name).to_string(),
+        Action::Resume => rust_i18n::t!("action.confirm.resume", name = name).to_string(),
         Action::Cordon => rust_i18n::t!("action.confirm.cordon", name = name).to_string(),
         Action::Uncordon => rust_i18n::t!("action.confirm.uncordon", name = name).to_string(),
         Action::Drain => rust_i18n::t!("action.confirm.drain", name = name).to_string(),
@@ -165,8 +168,11 @@ mod tests {
     fn everything_else_can_be_confirmed_the_moment_it_is_armed() {
         for action in [
             Action::Sync,
+            Action::Trigger,
             Action::Delete,
             Action::Restart,
+            Action::Suspend,
+            Action::Resume,
             Action::Cordon,
             Action::Drain,
             Action::Apply,

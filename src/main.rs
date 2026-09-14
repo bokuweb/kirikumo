@@ -135,6 +135,8 @@ fn main() -> Result<()> {
 
             let open_palette =
                 std::env::var_os("KIRIKUMO_DEMO_PALETTE").is_some_and(|value| value == "1");
+            let open_columns =
+                std::env::var_os("KIRIKUMO_DEMO_COLUMNS").is_some_and(|value| value == "1");
             let open = open_at_launch();
             cx.open_window(options, |window, cx| {
                 let shell = cx.new(|cx| {
@@ -152,6 +154,9 @@ fn main() -> Result<()> {
                 }
                 if open_palette {
                     shell.update(cx, |shell, cx| shell.open_palette_at_launch(cx));
+                }
+                if open_columns {
+                    shell.update(cx, |shell, cx| shell.open_columns_at_launch(cx));
                 }
                 cx.new(|cx| Root::new(shell, window, cx))
             })
