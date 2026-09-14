@@ -77,6 +77,7 @@ The centre strip carries the kind's name and the namespace it is scoped to, then
 A `uniform_list` of 28 px rows under a sticky header:
 
 - The **health mark** in the first 16 px, then the columns for the kind. The column set is `kubectl get`'s, per kind. A custom resource gets the columns its CRD declares, between NAME and AGE, headings upper-cased the way `kubectl` prints them, numeric ones right-aligned and `date` ones as ages; a CRD that declares none — and anything else with no set of its own — gets Name, Namespace (when namespaced), and Age.
+- Pod and Node tables gain compact **CPU** and **MEMORY** columns immediately before **AGE** only after the optional metrics API has answered for that scope. They use the same `143m` and `256Mi` units as the Overview panel, sort by the underlying quantities, and refresh every 30 seconds without blanking the old sample. Clusters without metrics keep the ordinary table width.
 - Reader column preferences reconcile against that default on every discovery: removed CRD columns are dropped and newly added ones appear at the end rather than being silently hidden by an older setting.
 - Names in mono; ages as the shortest unit that says it (`3d`, `2h17m`, `45s`), as `kubectl` writes them.
 - The header is clickable and sorts; the arrow says which way. The default is the kind's own: Age descending for Pods and Events, name ascending otherwise.
