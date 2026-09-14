@@ -13,7 +13,6 @@
 
 use gpui::{AppContext as _, Context, EventEmitter};
 use kirikumo_kube::portforward::{POLL, Poll};
-use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
     ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, ExecOutput,
     ExecRequest, Forwarder, LogRequest, Metrics, Object, ObjectList, Patch, PrinterColumn,
@@ -472,7 +471,11 @@ impl Store {
         let kind = resource.kind.clone();
         if let Err(error) = std::thread::Builder::new()
             .name(format!("kirikumo-watch-{kind}"))
-            .spawn(move || pump(cluster, resource, namespace, version, stop, sender))
+            .spawn(move || {
+                watch::pump(cluster, resource, namespace, version, stop, |event| {
+                    sender.send_blocking(event).is_ok()
+                })
+            })
         {
             tracing::warn!(%error, %kind, "could not start a watch");
             self.watch = None;
@@ -1349,60 +1352,6 @@ impl Store {
             .ok();
         })
         .detach();
-    }
-}
-
-/// One watch, read to its end on a thread of its own.
-///
-/// The retry policy lives here rather than in the store because it is about a
-/// connection, not about a window: an apiserver closes an idle watch on a
-/// timeout of its own, which is routine and reconnects at once, while a
-/// transport failure backs off (roadmap §4.7). What the store decides is the
-/// one thing a connection cannot: that a `410 Gone` means list again.
-///
-/// Returns when it is told to stop, when the channel is closed — which is
-/// what dropping the receiving task does — or when the failure is one that
-/// reconnecting cannot fix.
-fn pump(
-    cluster: Arc<dyn Cluster>,
-    resource: ApiResource,
-    namespace: Option<String>,
-    mut version: String,
-    stop: Arc<AtomicBool>,
-    sender: async_channel::Sender<WatchEvent>,
-) {
-    let mut backoff = Backoff::new();
-    while !stop.load(Ordering::Relaxed) {
-        match cluster.watch(&resource, namespace.as_deref(), &version) {
-            Ok(mut stream) => {
-                backoff.reset();
-                while let Some(event) = stream.next_event() {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    // Remembered before the event is given away, so a
-                    // reconnect resumes from the last thing we saw rather
-                    // than from the list.
-                    if let Some(seen) = event.resource_version() {
-                        version = seen.to_string();
-                    }
-                    let terminal = matches!(event, WatchEvent::Failed(_));
-                    if sender.send_blocking(event).is_err() || terminal {
-                        return;
-                    }
-                }
-                // The stream ended without saying anything: the apiserver's
-                // own idle timeout. Reconnect immediately, from where we got
-                // to — this is the common case and must cost nothing.
-            }
-            Err(error) => {
-                let retry = error.is_retryable();
-                if sender.send_blocking(WatchEvent::Failed(error)).is_err() || !retry {
-                    return;
-                }
-                std::thread::sleep(backoff.next_delay());
-            }
-        }
     }
 }
 

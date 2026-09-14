@@ -1371,6 +1371,7 @@ const SAMPLE_LOG: &str = "\
 2026-09-07T09:15:41.006Z INFO  GET /orders 200 1841ms
 2026-09-07T09:16:02.774Z ERROR upstream timeout service=inventory after=2s
 2026-09-07T09:16:02.775Z INFO  GET /cart 503 2003ms
+2026-09-07T09:16:03.019Z ERROR checkout failed method=POST path=/checkout status=503 trace_id=7a4d1cf6d4694c1192178dfd48e89b57 upstream=inventory.shop.svc reason=reservation_deadline_exceeded_after_three_attempts_the_cart_remains_open_and_no_payment_was_captured
 2026-09-07T09:16:33.410Z INFO  GET /healthz 200 0.3ms
 ";
 

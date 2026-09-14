@@ -43,6 +43,39 @@ pub fn count(lines: &[String], query: &str) -> usize {
         .count()
 }
 
+/// How a variable-height virtual log should update its measured rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualListChange {
+    /// Neither row identity nor content changed.
+    Keep,
+    /// This many rows were appended to the existing prefix.
+    Append(usize),
+    /// Existing row identities or contents changed and must be remeasured.
+    Reset,
+}
+
+/// Reconcile the filtered rows with the last rendered virtual log.
+///
+/// A pure append preserves every existing height measurement and the
+/// reader's scroll anchor. Search changes, removals, and a capped buffer that
+/// replaced content without changing its length require a reset.
+pub fn virtual_list_change(
+    previous: &[usize],
+    current: &[usize],
+    content_changed_without_growth: bool,
+) -> VirtualListChange {
+    if content_changed_without_growth {
+        return VirtualListChange::Reset;
+    }
+    if previous == current {
+        return VirtualListChange::Keep;
+    }
+    if current.starts_with(previous) {
+        return VirtualListChange::Append(current.len() - previous.len());
+    }
+    VirtualListChange::Reset
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +132,33 @@ mod tests {
     fn an_empty_log_answers_without_complaint() {
         assert!(matching(&[], "anything").is_empty());
         assert_eq!(count(&[], ""), 0);
+    }
+
+    #[test]
+    fn a_growing_match_set_only_appends_virtual_rows() {
+        assert_eq!(
+            virtual_list_change(&[0, 2], &[0, 2, 4], false),
+            VirtualListChange::Append(1)
+        );
+    }
+
+    #[test]
+    fn filtering_or_replacing_a_capped_log_resets_virtual_measurements() {
+        assert_eq!(
+            virtual_list_change(&[0, 2, 4], &[1, 3], false),
+            VirtualListChange::Reset
+        );
+        assert_eq!(
+            virtual_list_change(&[0, 1], &[0, 1], true),
+            VirtualListChange::Reset
+        );
+    }
+
+    #[test]
+    fn an_unchanged_log_keeps_its_virtual_measurements() {
+        assert_eq!(
+            virtual_list_change(&[0, 1], &[0, 1], false),
+            VirtualListChange::Keep
+        );
     }
 }

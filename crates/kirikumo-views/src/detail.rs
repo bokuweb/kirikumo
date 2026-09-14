@@ -25,6 +25,8 @@ use kirikumo_ui::detail::Target;
 use kirikumo_ui::terminal::{self, Style};
 use kirikumo_ui::{Tokens, detail, logs, time};
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 /// How tall one line of YAML or of a log is.
 const LINE_HEIGHT: Pixels = px(17.);
@@ -97,7 +99,16 @@ pub struct Detail {
     previous: bool,
     /// The find box over the log.
     find: Entity<InputState>,
-    scroll: UniformListScrollHandle,
+    /// Variable-height virtualization state for wrapped log lines.
+    log_list: ListState,
+    /// Whether long log lines wrap to the panel width.
+    wrap_logs: bool,
+    /// Filtered source indices represented by `log_list`.
+    visible_log_rows: Vec<usize>,
+    /// Detects appended or replaced content even at the 50,000-line cap.
+    log_fingerprint: u64,
+    /// The query represented by `visible_log_rows`.
+    log_query: String,
     /// How many lines the log had at the last frame, so that following can
     /// tell "something arrived" from "nothing did".
     last_lines: usize,
@@ -192,7 +203,12 @@ impl Detail {
             following: true,
             previous: false,
             find,
-            scroll: UniformListScrollHandle::new(),
+            log_list: ListState::new(0, ListAlignment::Top, px(256.))
+                .with_uniform_item_height(LINE_HEIGHT),
+            wrap_logs: true,
+            visible_log_rows: Vec::new(),
+            log_fingerprint: 0,
+            log_query: String::new(),
             last_lines: 0,
             scrolled_last_frame: false,
             pending: Pending::Idle,
@@ -251,6 +267,10 @@ impl Detail {
     fn stop_following(&mut self, cx: &mut Context<Self>) {
         self.store.update(cx, |store, _| store.stop_following_log());
         self.last_lines = 0;
+        self.visible_log_rows.clear();
+        self.log_fingerprint = 0;
+        self.log_query.clear();
+        self.log_list.reset(0);
     }
 
     /// Fetch again whatever the open tab is showing.
@@ -348,6 +368,10 @@ impl Detail {
         };
         let following = self.following;
         self.last_lines = 0;
+        self.visible_log_rows.clear();
+        self.log_fingerprint = 0;
+        self.log_query.clear();
+        self.log_list.reset(0);
         self.store
             .update(cx, |store, cx| store.show_log(request, following, cx));
         cx.notify();
@@ -1737,7 +1761,7 @@ impl Detail {
 
         v_flex()
             .size_full()
-            .bg(tokens.colors().bg_terminal)
+            .bg(tokens.colors().code_bg)
             .child(toolbar)
             .when(!allowed, |this| {
                 this.child(
@@ -2105,6 +2129,9 @@ impl Detail {
         let loading = fetch.as_ref().is_some_and(|fetch| fetch.is_loading());
         let query = self.find.read(cx).value().to_string();
         let visible = logs::matching(&lines, &query);
+        let mut hasher = DefaultHasher::new();
+        lines.hash(&mut hasher);
+        let fingerprint = hasher.finish();
 
         // Following means the end stays in view — until the reader takes
         // hold of the list. Checked only when something arrived, because
@@ -2114,15 +2141,34 @@ impl Detail {
         // yanking them back down. The end is where the scroll was at the
         // last layout, so a list we just scrolled ourselves gets a frame's
         // grace before it can count as "the reader moved it".
-        let arrived = lines.len() != self.last_lines && !visible.is_empty();
+        let arrived = fingerprint != self.log_fingerprint && !visible.is_empty();
+        let content_changed_without_growth =
+            (arrived && lines.len() <= self.last_lines) || query != self.log_query;
+        match logs::virtual_list_change(
+            &self.visible_log_rows,
+            &visible,
+            content_changed_without_growth,
+        ) {
+            logs::VirtualListChange::Keep => {}
+            logs::VirtualListChange::Append(count) => {
+                let at = self.log_list.item_count();
+                self.log_list.splice(at..at, count);
+            }
+            logs::VirtualListChange::Reset => self
+                .log_list
+                .reset_with_uniform_height(visible.len(), LINE_HEIGHT),
+        }
         if self.following && arrived {
-            match self.scroll.is_scrolled_to_end() {
+            match self.log_list.is_scrolled_to_end() {
                 Some(false) if !self.scrolled_last_frame => self.following = false,
-                _ => self.scroll.scroll_to_bottom(),
+                _ => self.log_list.scroll_to_end(),
             }
         }
         self.scrolled_last_frame = self.following && arrived;
         self.last_lines = lines.len();
+        self.log_fingerprint = fingerprint;
+        self.log_query.clone_from(&query);
+        self.visible_log_rows.clone_from(&visible);
 
         let pod_picker = (indirect && !pods.is_empty()).then(|| {
             h_flex()
@@ -2231,9 +2277,23 @@ impl Detail {
                         // *Follow* pressed is *jump to the end* as well: the
                         // reader who scrolled up and is done reading wants
                         // to be back where the new lines are.
-                        this.scroll.scroll_to_bottom();
+                        this.log_list.scroll_to_end();
                     }
                     this.reload_log(cx);
+                },
+            ))
+            .child(self.toggle(
+                "wrap",
+                rust_i18n::t!("detail.wrap").to_string(),
+                self.wrap_logs,
+                cx,
+                |this, cx| {
+                    this.wrap_logs = !this.wrap_logs;
+                    this.log_list.remeasure();
+                    if this.following {
+                        this.log_list.scroll_to_end();
+                    }
+                    cx.notify();
                 },
             ))
             .child(self.toggle(
@@ -2266,7 +2326,7 @@ impl Detail {
         let toolbar = v_flex()
             .w_full()
             .flex_shrink_0()
-            .bg(tokens.colors().bg_terminal)
+            .bg(tokens.colors().code_bg)
             .border_b_1()
             .border_color(tokens.colors().border_subtle)
             .children(pod_picker)
@@ -2296,26 +2356,27 @@ impl Detail {
             // `Arc`-free `String`s the list only ever reads.
             let all = lines.clone();
             let indices = visible.clone();
-            uniform_list("log", indices.len(), move |range, _window, _cx| {
-                range
-                    .map(|position| {
-                        let line = indices
-                            .get(position)
-                            .and_then(|index| all.get(*index))
-                            .cloned()
-                            .unwrap_or_default();
-                        div()
-                            .w_full()
-                            .h(LINE_HEIGHT)
-                            .px_3()
-                            .text_size(px(12.))
-                            .font_family("monospace")
-                            .text_color(colors.text_secondary)
-                            .child(line)
-                    })
-                    .collect()
+            let wrap = self.wrap_logs;
+            list(self.log_list.clone(), move |position, _window, _cx| {
+                let line = indices
+                    .get(position)
+                    .and_then(|index| all.get(*index))
+                    .cloned()
+                    .unwrap_or_default();
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .min_h(LINE_HEIGHT)
+                    .px_3()
+                    .text_size(px(12.))
+                    .line_height(LINE_HEIGHT)
+                    .font_family("monospace")
+                    .text_color(colors.text_secondary)
+                    .when(wrap, |this| this.whitespace_normal())
+                    .when(!wrap, |this| this.whitespace_nowrap())
+                    .child(line)
+                    .into_any_element()
             })
-            .track_scroll(&self.scroll)
             .size_full()
             .into_any_element()
         } else if indirect_pods_loading {
@@ -2344,7 +2405,7 @@ impl Detail {
 
         v_flex()
             .size_full()
-            .bg(tokens.colors().bg_terminal)
+            .bg(tokens.colors().code_bg)
             .child(toolbar)
             .child(
                 div()

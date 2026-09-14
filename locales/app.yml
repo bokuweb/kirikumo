@@ -209,6 +209,9 @@ detail.logs_empty:
 detail.follow:
   en: Follow
   ja: 追従
+detail.wrap:
+  en: Wrap
+  ja: 折り返し
 detail.previous:
   en: Previous
   ja: 前回
