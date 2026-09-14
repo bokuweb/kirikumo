@@ -24,7 +24,7 @@ use kirikumo_ui::palette::{Action, Command, Here};
 use kirikumo_ui::settings::{self, AppSettings};
 use kirikumo_ui::{HEADER_HEIGHT, Layout, Mode, Panel, Paths, TRAFFIC_LIGHT_INSET, Tokens, nav};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 actions!(
     kirikumo,
@@ -122,6 +122,8 @@ pub struct Shell {
     open_palette_pending: bool,
     /// The column panel was asked for before discovery chose a table.
     open_columns_pending: bool,
+    /// Brief feedback after the current table has reached the clipboard.
+    table_copied: bool,
     /// Something to put in the filter box at the next frame, which is the
     /// next place with a window to put it with.
     pending_filter: Option<String>,
@@ -283,6 +285,7 @@ impl Shell {
             showing_palette: false,
             open_palette_pending: false,
             open_columns_pending: false,
+            table_copied: false,
             pending_filter: None,
             open_at_launch: None,
             tab_at_launch: None,
@@ -438,6 +441,27 @@ impl Shell {
         self.store.update(cx, |store, cx| store.refresh_all(cx));
         self.table.update(cx, |table, cx| table.refresh(cx));
         self.detail.update(cx, |detail, cx| detail.refresh(cx));
+    }
+
+    /// Copy exactly the rows and columns currently visible in the centre.
+    fn copy_table(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.table.read(cx).clipboard_tsv() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.table_copied = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1_500))
+                .await;
+            this.update(cx, |this, cx| {
+                this.table_copied = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle(&mut self, panel: Panel, cx: &mut Context<Self>) {
@@ -1001,6 +1025,25 @@ impl Shell {
                 this.table.update(cx, |table, cx| table.toggle_columns(cx));
             },
         );
+        let copy = self.icon_button(
+            "copy-table",
+            match self.table_copied {
+                true => Icon::empty()
+                    .path(icon::CHECK)
+                    .size_4()
+                    .text_color(tokens.colors().accent),
+                false => Icon::new(IconName::Copy)
+                    .size_4()
+                    .text_color(tokens.colors().text_secondary),
+            },
+            rust_i18n::t!(match self.table_copied {
+                true => "table.copied",
+                false => "table.copy",
+            })
+            .to_string(),
+            cx,
+            |this, _, cx| this.copy_table(cx),
+        );
         let right_toggle = self.panel_toggle(
             Panel::RightPanel,
             IconName::PanelRightClose,
@@ -1054,6 +1097,7 @@ impl Shell {
                             .flex_shrink_0()
                             .child(Input::new(&self.filter).cleanable(true)),
                     )
+                    .child(copy)
                     .child(columns)
                     .child(refresh)
                     .child(right_toggle),

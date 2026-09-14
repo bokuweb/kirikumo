@@ -19,6 +19,7 @@ use kirikumo_ui::settings::ColumnPreference;
 use kirikumo_ui::table::{self, ColumnSet, Row, Width};
 use kirikumo_ui::{Filter, Tokens};
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// How tall a row is. One line, because this is a comparison list and not a
 /// reading list (`docs/ui.md` §1.7).
@@ -65,6 +66,8 @@ pub struct ResourceTable {
     sort: (usize, bool),
     /// The row that is open on the right, by its key.
     selected: Option<String>,
+    /// Invalidates the 30-second metrics sampler when table scope changes.
+    metrics_generation: u64,
 }
 
 impl ResourceTable {
@@ -92,6 +95,7 @@ impl ResourceTable {
             query: String::new(),
             sort,
             selected: None,
+            metrics_generation: 0,
         }
     }
 
@@ -120,6 +124,21 @@ impl ResourceTable {
         (self.visible.len(), self.rows.len())
     }
 
+    /// The visible table as pasteable tab-separated text.
+    ///
+    /// `visible` already carries the active filter in the sorted row order,
+    /// while `columns` already carries visibility and reader-chosen order.
+    pub fn clipboard_tsv(&self) -> Option<String> {
+        (!self.visible.is_empty()).then(|| {
+            table::clipboard_tsv(
+                &self.columns,
+                self.visible
+                    .iter()
+                    .filter_map(|index| self.rows.get(*index)),
+            )
+        })
+    }
+
     /// Open or close the column controls anchored over this table.
     pub fn toggle_columns(&mut self, cx: &mut Context<Self>) {
         self.showing_columns = !self.showing_columns;
@@ -137,6 +156,7 @@ impl ResourceTable {
             self.kind = Some(kind.clone());
             self.showing_columns = false;
             self.recolumn(cx);
+            self.schedule_metrics(cx);
         }
         self.ask(cx);
         self.rebuild(cx);
@@ -149,6 +169,7 @@ impl ResourceTable {
         self.selected = None;
         self.rows.clear();
         self.visible.clear();
+        self.metrics_generation += 1;
         self.store.update(cx, |store, cx| store.follow(None, cx));
         cx.notify();
     }
@@ -164,7 +185,8 @@ impl ResourceTable {
         let namespace = self.namespace.clone();
         self.store.update(cx, |store, cx| {
             let followed = store.list_key(&kind, namespace.as_deref());
-            store.ensure_list(kind, namespace.as_deref(), cx);
+            store.ensure_list(kind.clone(), namespace.as_deref(), cx);
+            store.ensure_metrics(&kind.kind, namespace.as_deref(), cx);
             store.follow(Some(followed), cx);
         });
     }
@@ -175,6 +197,7 @@ impl ResourceTable {
             return;
         }
         self.namespace = namespace;
+        self.schedule_metrics(cx);
         self.recolumn(cx);
         self.ask(cx);
         self.rebuild(cx);
@@ -191,9 +214,51 @@ impl ResourceTable {
         if let Some(kind) = self.kind.clone() {
             let namespace = self.namespace.clone();
             self.store.update(cx, |store, cx| {
-                store.load_list(kind, namespace.as_deref(), cx)
+                store.load_list(kind.clone(), namespace.as_deref(), cx);
+                store.refresh_metrics_if_available(&kind.kind, namespace.as_deref(), cx);
             });
         }
+    }
+
+    /// Sample optional metrics every 30 seconds while this exact table scope
+    /// remains on screen. Object watches cannot update values from a separate
+    /// API, so metrics own their small clock.
+    fn schedule_metrics(&mut self, cx: &mut Context<Self>) {
+        self.metrics_generation += 1;
+        let generation = self.metrics_generation;
+        let Some(kind) = self
+            .kind
+            .clone()
+            .filter(|kind| matches!(kind.kind.as_str(), "Pod" | "Node"))
+        else {
+            return;
+        };
+        let namespace = self.namespace.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+                let carry_on = this
+                    .update(cx, |this, cx| {
+                        if this.metrics_generation != generation
+                            || this.kind.as_ref() != Some(&kind)
+                            || this.namespace != namespace
+                        {
+                            return false;
+                        }
+                        this.store.update(cx, |store, cx| {
+                            store.refresh_metrics_if_available(&kind.kind, namespace.as_deref(), cx)
+                        });
+                        true
+                    })
+                    .unwrap_or(false);
+                if !carry_on {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Choose the columns for the kind and the current scope.
@@ -212,6 +277,13 @@ impl ResourceTable {
             Some(resource) => ColumnSet::for_resource(resource, show_namespace, printer),
             None => ColumnSet::for_kind("", true, show_namespace),
         };
+        if self.kind.as_ref().is_some_and(|kind| {
+            store
+                .metrics(&kind.kind, self.namespace.as_deref())
+                .is_some()
+        }) {
+            self.default_columns = self.default_columns.clone().with_metrics();
+        }
         self.columns = match self.kind.as_ref() {
             Some(kind) => self.default_columns.clone().with_preferences(
                 self.preferences
@@ -322,7 +394,15 @@ impl ResourceTable {
             .read(cx)
             .printer_columns(&kind)
             .is_some_and(|columns| !columns.is_empty());
-        if self.columns.kind().is_empty() || (printer_known && self.columns.is_generic()) {
+        let metrics_known = self
+            .store
+            .read(cx)
+            .metrics(&kind.kind, self.namespace.as_deref())
+            .is_some();
+        if self.columns.kind().is_empty()
+            || (printer_known && self.columns.is_generic())
+            || metrics_known != self.default_columns.has_metrics()
+        {
             self.recolumn(cx);
             // A new set of columns is a new set of cells: rows built for the
             // old one must not be reused by their version, or the table would
@@ -336,11 +416,20 @@ impl ResourceTable {
         // what makes a live table expensive (`kirikumo_ui::ColumnSet::rows`).
         let previous = std::mem::take(&mut self.rows);
         let store = self.store.read(cx);
-        self.rows = store
+        self.rows = match store
             .list(&kind, self.namespace.as_deref())
             .and_then(|list| list.value())
-            .map(|list| self.columns.rows(&list.items, &previous, now))
-            .unwrap_or_default();
+        {
+            Some(list) => self.columns.rows_with_metrics(
+                &list.items,
+                &previous,
+                store
+                    .metrics(&kind.kind, self.namespace.as_deref())
+                    .unwrap_or_default(),
+                now,
+            ),
+            None => Vec::new(),
+        };
         let (column, ascending) = self.sort;
         table::sort(&mut self.rows, &self.columns, column, ascending);
         self.refilter(cx);

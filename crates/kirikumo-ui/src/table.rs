@@ -14,7 +14,8 @@
 
 use chrono::{DateTime, Utc};
 use kirikumo_kube::{
-    ApiResource, Health, Level, Object, PrinterColumn, ResourceKey, health, jsonpath, quantity,
+    ApiResource, Health, Level, Metrics, Object, PrinterColumn, ResourceKey, health, jsonpath,
+    quantity,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -135,6 +136,10 @@ enum Cell {
     RoleRef,
     /// An endpoints object's addresses.
     Endpoints,
+    /// Current CPU use from `metrics.k8s.io`.
+    Cpu,
+    /// Current memory use from `metrics.k8s.io`.
+    Memory,
 }
 
 /// The columns for one kind, and what fills them.
@@ -356,6 +361,40 @@ impl ColumnSet {
         set
     }
 
+    /// Add live resource-use columns when `metrics.k8s.io` answered.
+    ///
+    /// The caller only applies this after a successful metrics response, so
+    /// a cluster without metrics keeps the ordinary table instead of showing
+    /// two permanently empty columns. Metrics sit beside the workload facts
+    /// and before AGE, matching `kubectl top`'s compact units.
+    pub fn with_metrics(mut self) -> Self {
+        if !matches!(self.kind.as_str(), "Pod" | "Node")
+            || self
+                .columns
+                .iter()
+                .any(|(_, cell)| matches!(cell, Cell::Cpu))
+        {
+            return self;
+        }
+        let age = self.columns.pop();
+        self.columns.extend([
+            (Column::num("CPU", 68.), Cell::Cpu),
+            (Column::num("MEMORY", 88.), Cell::Memory),
+        ]);
+        self.columns.extend(age);
+        if self.default_sort != 0 {
+            self.default_sort = self.columns.len() - 1;
+        }
+        self
+    }
+
+    /// Whether this set includes live resource-use columns.
+    pub fn has_metrics(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|(_, cell)| matches!(cell, Cell::Cpu))
+    }
+
     /// Whether this is the fallback table — NAME, maybe NAMESPACE, AGE — with
     /// nothing kind-specific in it, which is when a CRD's own columns are
     /// worth more than ours.
@@ -484,15 +523,35 @@ impl ColumnSet {
 
     /// One object's cells, in column order.
     pub fn cells(&self, object: &Object, now: DateTime<Utc>) -> Vec<String> {
+        self.cells_with_metrics(object, None, now)
+    }
+
+    /// One object's cells, including live usage when it was available.
+    pub fn cells_with_metrics(
+        &self,
+        object: &Object,
+        usage: Option<&Metrics>,
+        now: DateTime<Utc>,
+    ) -> Vec<String> {
         self.columns
             .iter()
-            .map(|(_, cell)| render(cell, &self.kind, object, now))
+            .map(|(_, cell)| render(cell, &self.kind, object, usage, now))
             .collect()
     }
 
     /// One row, ready to draw.
     pub fn row(&self, object: &Object, now: DateTime<Utc>) -> Row {
-        let cells = self.cells(object, now);
+        self.row_with_metrics(object, None, now)
+    }
+
+    /// One row including current resource use, ready to draw.
+    pub fn row_with_metrics(
+        &self,
+        object: &Object,
+        usage: Option<&Metrics>,
+        now: DateTime<Utc>,
+    ) -> Row {
+        let cells = self.cells_with_metrics(object, usage, now);
         // What the filter box matches against: every cell, plus the labels,
         // because "app=api" is a thing people type.
         let mut haystack = cells.join(" ");
@@ -511,6 +570,7 @@ impl ColumnSet {
             cells,
             haystack: haystack.to_lowercase(),
             version: object.meta.resource_version.clone(),
+            usage: usage.map(|usage| (usage.cpu_milli, usage.memory_bytes)),
         }
     }
 
@@ -527,19 +587,48 @@ impl ColumnSet {
     /// since gone; both are ignored. The answer is always in `objects`' order
     /// and holds exactly one row per object, so a caller sorts afterwards.
     pub fn rows(&self, objects: &[Object], previous: &[Row], now: DateTime<Utc>) -> Vec<Row> {
+        self.rows_with_metrics(objects, previous, &[], now)
+    }
+
+    /// Rows for a whole list, joined to current metrics by namespace and name.
+    pub fn rows_with_metrics(
+        &self,
+        objects: &[Object],
+        previous: &[Row],
+        metrics: &[Metrics],
+        now: DateTime<Utc>,
+    ) -> Vec<Row> {
         let kept: HashMap<&str, &Row> =
             previous.iter().map(|row| (row.key.as_str(), row)).collect();
+        let usage: HashMap<(Option<&str>, &str), &Metrics> = metrics
+            .iter()
+            .map(|metrics| {
+                (
+                    (metrics.namespace.as_deref(), metrics.name.as_str()),
+                    metrics,
+                )
+            })
+            .collect();
         objects
             .iter()
             .map(|object| {
                 let identity = object.meta.identity();
+                let metrics = usage
+                    .get(&(object.meta.namespace.as_deref(), object.meta.name.as_str()))
+                    .copied();
+                let fingerprint = metrics.map(|usage| (usage.cpu_milli, usage.memory_bytes));
                 match kept.get(identity.as_str()) {
                     // The AGE cell is the one thing that goes stale without
                     // the object changing, so a reused row is only right
                     // between watch events — which is exactly when it is
                     // used. A refresh rebuilds from scratch.
-                    Some(row) if row.version == object.meta.resource_version => (*row).clone(),
-                    _ => self.row(object, now),
+                    Some(row)
+                        if row.version == object.meta.resource_version
+                            && row.usage == fingerprint =>
+                    {
+                        (*row).clone()
+                    }
+                    _ => self.row_with_metrics(object, metrics, now),
                 }
             })
             .collect()
@@ -582,12 +671,47 @@ pub struct Row {
     /// every row whose version has not moved is reused rather than
     /// reformatted. See [`ColumnSet::rows`].
     pub version: String,
+    /// The metric values this row was formatted with, for safe row reuse.
+    usage: Option<(u64, u64)>,
 }
 
 impl Row {
     /// Whether this row is one the reader should look at.
     pub fn is_bad(&self) -> bool {
         self.health.level.is_bad()
+    }
+}
+
+/// Render the current table shape as tab-separated text for the clipboard.
+///
+/// The caller supplies rows in display order, which makes the export follow
+/// the active sort and filter without teaching this pure layer either UI
+/// concept. Columns already reflect visibility and reader-chosen order.
+/// Fields containing a tab, line break or quote use CSV-style quoting so a
+/// spreadsheet paste keeps the same grid.
+pub fn clipboard_tsv<'a>(columns: &ColumnSet, rows: impl IntoIterator<Item = &'a Row>) -> String {
+    let mut lines = Vec::new();
+    lines.push(
+        columns
+            .columns()
+            .map(|column| quote_tsv(&column.title))
+            .collect::<Vec<_>>()
+            .join("\t"),
+    );
+    lines.extend(rows.into_iter().map(|row| {
+        row.cells
+            .iter()
+            .map(|cell| quote_tsv(cell))
+            .collect::<Vec<_>>()
+            .join("\t")
+    }));
+    lines.join("\n")
+}
+
+fn quote_tsv(value: &str) -> String {
+    match value.contains(['\t', '\n', '\r', '"']) {
+        true => format!("\"{}\"", value.replace('"', "\"\"")),
+        false => value.to_string(),
     }
 }
 
@@ -603,6 +727,30 @@ pub fn sort(rows: &mut [Row], columns: &ColumnSet, column: usize, ascending: boo
         rows.sort_by(|a, b| match ascending {
             true => b.created.cmp(&a.created),
             false => a.created.cmp(&b.created),
+        });
+        return;
+    }
+    let metric = columns
+        .columns
+        .get(column)
+        .and_then(|(_, cell)| match cell {
+            Cell::Cpu => Some(0),
+            Cell::Memory => Some(1),
+            _ => None,
+        });
+    if let Some(metric) = metric {
+        rows.sort_by(|left, right| {
+            let value = |row: &Row| {
+                row.usage
+                    .map(|(cpu, memory)| if metric == 0 { cpu } else { memory })
+            };
+            match (value(left), value(right)) {
+                (Some(left), Some(right)) if ascending => left.cmp(&right),
+                (Some(left), Some(right)) => right.cmp(&left),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
         });
         return;
     }
@@ -626,7 +774,13 @@ fn numeric(cell: &str) -> Option<f64> {
 }
 
 /// Read one cell out of an object.
-fn render(cell: &Cell, kind: &str, object: &Object, now: DateTime<Utc>) -> String {
+fn render(
+    cell: &Cell,
+    kind: &str,
+    object: &Object,
+    usage: Option<&Metrics>,
+    now: DateTime<Utc>,
+) -> String {
     match cell {
         Cell::JsonPath(path) => jsonpath::cell(&object.raw, path),
         Cell::JsonPathDate(path) => {
@@ -701,6 +855,12 @@ fn render(cell: &Cell, kind: &str, object: &Object, now: DateTime<Utc>) -> Strin
             }
         }
         Cell::Endpoints => endpoints(object),
+        Cell::Cpu => usage
+            .map(|usage| crate::time::cpu(usage.cpu_milli))
+            .unwrap_or_else(|| NONE.to_string()),
+        Cell::Memory => usage
+            .map(|usage| crate::time::bytes(usage.memory_bytes))
+            .unwrap_or_else(|| NONE.to_string()),
     }
 }
 
@@ -1018,6 +1178,131 @@ mod tests {
     }
 
     #[test]
+    fn pod_metrics_add_cpu_and_memory_columns_only_when_the_cluster_answers() {
+        let columns = ColumnSet::for_kind("Pod", true, false).with_metrics();
+        let titles: Vec<&str> = columns
+            .columns()
+            .map(|column| column.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "NAME", "READY", "STATUS", "RESTARTS", "IP", "NODE", "CPU", "MEMORY", "AGE"
+            ]
+        );
+
+        let usage = Metrics {
+            name: "api-7d9f8c-2xk".into(),
+            namespace: Some("shop".into()),
+            cpu_milli: 143,
+            memory_bytes: 268_435_456,
+        };
+        let cells = columns.cells_with_metrics(&pod(), Some(&usage), now());
+        assert_eq!(cells[6], "143m");
+        assert_eq!(cells[7], "256Mi");
+    }
+
+    #[test]
+    fn metrics_are_part_of_row_reuse_identity_even_when_the_object_did_not_change() {
+        let columns = ColumnSet::for_kind("Pod", true, false).with_metrics();
+        let object = pod();
+        let before = Metrics {
+            name: object.meta.name.clone(),
+            namespace: object.meta.namespace.clone(),
+            cpu_milli: 100,
+            memory_bytes: 1024,
+        };
+        let after = Metrics {
+            cpu_milli: 250,
+            ..before.clone()
+        };
+        let previous = columns.row_with_metrics(&object, Some(&before), now());
+
+        let rows = columns.rows_with_metrics(
+            std::slice::from_ref(&object),
+            &[previous],
+            std::slice::from_ref(&after),
+            now(),
+        );
+        let cpu = columns
+            .columns()
+            .position(|column| column.title == "CPU")
+            .unwrap();
+        assert_eq!(rows[0].cells[cpu], "250m");
+    }
+
+    #[test]
+    fn all_namespace_metrics_match_both_namespace_and_name() {
+        let columns = ColumnSet::for_kind("Pod", true, true).with_metrics();
+        let shop = pod();
+        let system = object(json!({
+            "metadata": {"name": "api-7d9f8c-2xk", "namespace": "kube-system", "uid": "u2"},
+            "status": {"phase": "Running"}
+        }));
+        let metrics = vec![
+            Metrics {
+                name: "api-7d9f8c-2xk".into(),
+                namespace: Some("kube-system".into()),
+                cpu_milli: 9,
+                memory_bytes: 2048,
+            },
+            Metrics {
+                name: "api-7d9f8c-2xk".into(),
+                namespace: Some("shop".into()),
+                cpu_milli: 143,
+                memory_bytes: 268_435_456,
+            },
+        ];
+
+        let rows = columns.rows_with_metrics(&[shop, system], &[], &metrics, now());
+        let cpu = columns
+            .columns()
+            .position(|column| column.title == "CPU")
+            .unwrap();
+        assert_eq!(rows[0].cells[cpu], "143m");
+        assert_eq!(rows[1].cells[cpu], "9m");
+    }
+
+    #[test]
+    fn clipboard_export_is_the_current_columns_and_rows_in_their_current_order() {
+        let columns = ColumnSet::for_kind("Pod", true, false).with_preferences(&[
+            ColumnPreference::shown("STATUS", None),
+            ColumnPreference::shown("NAME", None),
+            ColumnPreference::hidden("READY"),
+            ColumnPreference::hidden("RESTARTS"),
+            ColumnPreference::hidden("IP"),
+            ColumnPreference::hidden("NODE"),
+            ColumnPreference::hidden("AGE"),
+        ]);
+        let first = columns.row(&pod(), now());
+        let second = columns.row(
+            &object(json!({
+                "metadata": {"name": "worker", "namespace": "shop", "uid": "u2"},
+                "spec": {"containers": [{"name": "worker"}]},
+                "status": {"phase": "Pending"}
+            })),
+            now(),
+        );
+
+        assert_eq!(
+            clipboard_tsv(&columns, [&second, &first]),
+            "STATUS\tNAME\nPending\tworker\nRunning\tapi-7d9f8c-2xk"
+        );
+    }
+
+    #[test]
+    fn clipboard_export_quotes_cells_that_would_change_the_grid() {
+        let columns = ColumnSet::for_kind("Rollout", true, false);
+        let mut row = columns.row(&object(json!({"metadata": {"name": "demo"}})), now());
+        row.cells[0] = "a\tb\n\"quoted\"".into();
+
+        assert_eq!(
+            clipboard_tsv(&columns, [&row]),
+            "NAME\tAGE\n\"a\tb\n\"\"quoted\"\"\"\t<unknown>"
+        );
+    }
+
+    #[test]
     fn a_row_carries_its_health_and_a_haystack_the_filter_can_match_labels_in() {
         let row = ColumnSet::for_kind("Pod", true, false).row(&pod(), now());
         assert_eq!(row.key, "u1");
@@ -1168,6 +1453,41 @@ mod tests {
         sort(&mut rows, &columns, restarts, true);
         let order: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(order, vec!["two", "nine", "ten"]);
+    }
+
+    #[test]
+    fn sorting_metrics_uses_the_quantities_behind_the_formatted_units() {
+        let columns = ColumnSet::for_kind("Pod", true, false).with_metrics();
+        let make = |name: &str, cpu_milli: u64, memory_bytes: u64| {
+            let object = object(json!({"metadata": {"name": name, "uid": name}}));
+            let usage = Metrics {
+                name: name.into(),
+                namespace: None,
+                cpu_milli,
+                memory_bytes,
+            };
+            columns.row_with_metrics(&object, Some(&usage), now())
+        };
+        let mut rows = vec![
+            make("large", 100, 1024),
+            make("small", 9, 1024),
+            columns.row(&object(json!({"metadata": {"name": "unknown"}})), now()),
+        ];
+        let cpu = columns
+            .columns()
+            .position(|column| column.title == "CPU")
+            .unwrap();
+
+        sort(&mut rows, &columns, cpu, true);
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["small", "large", "unknown"]
+        );
+        sort(&mut rows, &columns, cpu, false);
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["large", "small", "unknown"]
+        );
     }
 
     #[test]
