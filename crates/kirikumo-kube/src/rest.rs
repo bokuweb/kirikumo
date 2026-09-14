@@ -11,6 +11,7 @@
 //! hangs is a table that never fills; a watch must not, because a watch that
 //! says nothing for an hour is a watch working exactly as designed.
 
+use crate::actions;
 use crate::auth::Authenticator;
 use crate::discovery::{self, ResourceListWire};
 use crate::error::{Error, Result};
@@ -625,6 +626,29 @@ impl Cluster for Rest {
             &resource.object_path(namespace, name),
             patch.content_type(),
             patch.body(),
+        )?;
+        let value: Value =
+            serde_json::from_str(&answer).map_err(|error| Error::Malformed(error.to_string()))?;
+        Object::new(value)
+    }
+
+    fn trigger_cron_job(&self, resource: &ApiResource, cron_job: &Object) -> Result<Object> {
+        if resource.group != "batch" || resource.kind != "CronJob" {
+            return Err(Error::Malformed(
+                "only a batch CronJob can be triggered".into(),
+            ));
+        }
+        let namespace = cron_job
+            .meta
+            .namespace
+            .as_deref()
+            .ok_or_else(|| Error::Malformed("CronJob has no namespace".into()))?;
+        let body = actions::manual_job(cron_job)?;
+        let answer = self.send(
+            Method::Post,
+            &format!("{}/namespaces/{namespace}/jobs", resource.url_prefix()),
+            "application/json",
+            &body,
         )?;
         let value: Value =
             serde_json::from_str(&answer).map_err(|error| Error::Malformed(error.to_string()))?;

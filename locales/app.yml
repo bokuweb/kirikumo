@@ -96,9 +96,27 @@ table.pick_a_kind:
 table.refresh:
   en: Refresh
   ja: 再読み込み
+table.copy:
+  en: Copy visible table
+  ja: 表示中の表をコピー
+table.copied:
+  en: Copied
+  ja: コピーしました
 table.rows:
   en: "%{shown} of %{total}"
   ja: "%{total} 件中 %{shown} 件"
+table.columns.open:
+  en: Columns
+  ja: 列の設定
+table.columns.title:
+  en: Columns
+  ja: 列
+table.columns.auto:
+  en: Auto
+  ja: 自動
+table.columns.reset:
+  en: Reset
+  ja: リセット
 
 palette.placeholder:
   en: Go to a kind, a namespace, a cluster…
@@ -228,6 +246,9 @@ detail.container:
 action.sync:
   en: Sync
   ja: 同期
+action.trigger:
+  en: Trigger
+  ja: 今すぐ実行
 action.scale:
   en: Scale
   ja: スケール
@@ -273,6 +294,12 @@ action.replicas:
 action.confirm.sync:
   en: "Sync %{name}"
   ja: "%{name} を同期"
+action.confirm.trigger:
+  en: "Trigger %{name} now"
+  ja: "%{name} を今すぐ実行"
+action.triggered:
+  en: "Created Job %{name}"
+  ja: "Job %{name} を作成しました"
 action.confirm.scale:
   en: "Scale %{name} to %{replicas}"
   ja: "%{name} を %{replicas} にスケール"

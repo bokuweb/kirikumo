@@ -24,7 +24,7 @@ use kirikumo_ui::palette::{Action, Command, Here};
 use kirikumo_ui::settings::{self, AppSettings};
 use kirikumo_ui::{HEADER_HEIGHT, Layout, Mode, Panel, Paths, TRAFFIC_LIGHT_INSET, Tokens, nav};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 actions!(
     kirikumo,
@@ -120,6 +120,10 @@ pub struct Shell {
     showing_palette: bool,
     /// The palette was asked for before there was a window to open it in.
     open_palette_pending: bool,
+    /// The column panel was asked for before discovery chose a table.
+    open_columns_pending: bool,
+    /// Brief feedback after the current table has reached the clipboard.
+    table_copied: bool,
     /// Something to put in the filter box at the next frame, which is the
     /// next place with a window to put it with.
     pending_filter: Option<String>,
@@ -173,7 +177,8 @@ impl Shell {
                 .placeholder(rust_i18n::t!("table.namespace_placeholder").to_string())
         });
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), window, cx));
-        let table = cx.new(|cx| ResourceTable::new(store.clone(), cx));
+        let table =
+            cx.new(|cx| ResourceTable::new(store.clone(), settings.table_columns.clone(), cx));
         let detail = cx.new(|cx| Detail::new(store.clone(), window, cx));
         let palette = cx.new(|cx| Palette::new(store.clone(), window, cx));
 
@@ -210,6 +215,19 @@ impl Shell {
                 if !this.layout.is_open(Panel::RightPanel) {
                     this.toggle(Panel::RightPanel, cx);
                 }
+            }
+            TableEvent::ColumnsChanged {
+                resource,
+                preferences,
+            } => {
+                if preferences.is_empty() {
+                    this.settings.table_columns.remove(resource);
+                } else {
+                    this.settings
+                        .table_columns
+                        .insert(resource.clone(), preferences.clone());
+                }
+                this.persist();
             }
         }));
         subscriptions.push(
@@ -266,6 +284,8 @@ impl Shell {
             palette,
             showing_palette: false,
             open_palette_pending: false,
+            open_columns_pending: false,
+            table_copied: false,
             pending_filter: None,
             open_at_launch: None,
             tab_at_launch: None,
@@ -421,6 +441,27 @@ impl Shell {
         self.store.update(cx, |store, cx| store.refresh_all(cx));
         self.table.update(cx, |table, cx| table.refresh(cx));
         self.detail.update(cx, |detail, cx| detail.refresh(cx));
+    }
+
+    /// Copy exactly the rows and columns currently visible in the centre.
+    fn copy_table(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.table.read(cx).clipboard_tsv() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.table_copied = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1_500))
+                .await;
+            this.update(cx, |this, cx| {
+                this.table_copied = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle(&mut self, panel: Panel, cx: &mut Context<Self>) {
@@ -619,6 +660,14 @@ impl Shell {
     /// the palette is worth an environment variable.
     pub fn open_palette_at_launch(&mut self, cx: &mut Context<Self>) {
         self.open_palette_pending = true;
+        cx.notify();
+    }
+
+    /// Open the current table's column panel after discovery has landed.
+    ///
+    /// Used by `KIRIKUMO_DEMO_COLUMNS=1` for deterministic visual checks.
+    pub fn open_columns_at_launch(&mut self, cx: &mut Context<Self>) {
+        self.open_columns_pending = true;
         cx.notify();
     }
 
@@ -964,6 +1013,37 @@ impl Shell {
             cx,
             |this, _, cx| this.refresh(cx),
         );
+        let columns = self.icon_button(
+            "columns",
+            Icon::empty()
+                .path(icon::SETTINGS)
+                .size_4()
+                .text_color(tokens.colors().text_secondary),
+            rust_i18n::t!("table.columns.open").to_string(),
+            cx,
+            |this, _, cx| {
+                this.table.update(cx, |table, cx| table.toggle_columns(cx));
+            },
+        );
+        let copy = self.icon_button(
+            "copy-table",
+            match self.table_copied {
+                true => Icon::empty()
+                    .path(icon::CHECK)
+                    .size_4()
+                    .text_color(tokens.colors().accent),
+                false => Icon::new(IconName::Copy)
+                    .size_4()
+                    .text_color(tokens.colors().text_secondary),
+            },
+            rust_i18n::t!(match self.table_copied {
+                true => "table.copied",
+                false => "table.copy",
+            })
+            .to_string(),
+            cx,
+            |this, _, cx| this.copy_table(cx),
+        );
         let right_toggle = self.panel_toggle(
             Panel::RightPanel,
             IconName::PanelRightClose,
@@ -1017,6 +1097,8 @@ impl Shell {
                             .flex_shrink_0()
                             .child(Input::new(&self.filter).cleanable(true)),
                     )
+                    .child(copy)
+                    .child(columns)
                     .child(refresh)
                     .child(right_toggle),
             );
@@ -1070,6 +1152,10 @@ impl Render for Shell {
         if self.open_palette_pending && self.store.read(cx).catalogue().value().is_some() {
             self.open_palette_pending = false;
             self.on_toggle_palette(&TogglePalette, window, cx);
+        }
+        if self.open_columns_pending && self.table.read(cx).kind().is_some() {
+            self.open_columns_pending = false;
+            self.table.update(cx, |table, cx| table.toggle_columns(cx));
         }
         let tokens = Tokens::global(cx).clone();
         let standard = tokens.duration_ms.standard();
