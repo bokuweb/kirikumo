@@ -782,8 +782,63 @@ impl Store {
         }
     }
 
+    /// Refresh metrics that have previously succeeded, keeping their stale
+    /// values on screen while the next sample is fetched.
+    ///
+    /// An unsupported metrics API is deliberately not retried on this clock;
+    /// only a successful first answer opts a scope into periodic sampling.
+    pub fn refresh_metrics_if_available(
+        &mut self,
+        kind: &str,
+        namespace: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        match kind {
+            "Node" if self.node_metrics.value().is_some() && !self.node_metrics.is_loading() => {
+                self.node_metrics.begin();
+                self.fetch(
+                    cx,
+                    |cluster| cluster.node_metrics(),
+                    |this, result, _| this.node_metrics.finish(result),
+                );
+            }
+            "Pod" => {
+                let scope = namespace.map(str::to_string);
+                let refresh = self
+                    .pod_metrics
+                    .get(&scope)
+                    .is_some_and(|fetch| fetch.value().is_some() && !fetch.is_loading());
+                if !refresh {
+                    return;
+                }
+                self.pod_metrics.entry(scope.clone()).or_default().begin();
+                let asked = scope.clone();
+                self.fetch(
+                    cx,
+                    move |cluster| cluster.pod_metrics(asked.as_deref()),
+                    move |this, result, _| {
+                        this.pod_metrics.entry(scope).or_default().finish(result);
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// What one object is using, if anything has said.
     pub fn metrics_for(&self, kind: &str, namespace: Option<&str>, name: &str) -> Option<&Metrics> {
+        self.metrics(kind, namespace)?
+            .iter()
+            .find(|metrics| metrics.name == name)
+    }
+
+    /// Every metric in one table scope after the optional API answered.
+    ///
+    /// `Some(&[])` means the metrics API exists but the scope is empty;
+    /// `None` also covers loading and unsupported clusters. That distinction
+    /// lets the table add usage columns only when the cluster can populate
+    /// them.
+    pub fn metrics(&self, kind: &str, namespace: Option<&str>) -> Option<&[Metrics]> {
         let held = match kind {
             "Node" => self.node_metrics.value()?,
             "Pod" => self
@@ -792,7 +847,7 @@ impl Store {
                 .value()?,
             _ => return None,
         };
-        held.iter().find(|metrics| metrics.name == name)
+        Some(held.as_slice())
     }
 
     /// Whether this login may do a verb on a kind, if the cluster has said.
