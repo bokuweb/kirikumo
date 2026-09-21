@@ -731,4 +731,47 @@ mod tests {
             [WatchEvent::Failed(Error::Forbidden(_))]
         ));
     }
+
+    #[test]
+    fn recovery_forbidden_retries_are_bounded() {
+        let stop = AtomicBool::new(false);
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let mut emitted = Vec::new();
+        pump_with_wait(
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(Error::Transport("apiserver restarting".into()))
+                } else {
+                    Err(Error::Forbidden("authorization not ready".into()))
+                }
+            },
+            "1".into(),
+            &stop,
+            |event| {
+                emitted.push(event);
+                true
+            },
+            |_, delay| {
+                waits.push(delay);
+                true
+            },
+        );
+
+        assert_eq!(attempts, 5);
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+            ]
+        );
+        assert!(matches!(
+            emitted.as_slice(),
+            [WatchEvent::Failed(Error::Forbidden(_))]
+        ));
+    }
 }

@@ -243,7 +243,7 @@ This is the explicit boundary between useful parity and copying Lens wholesale. 
 
 ## 6. Quality bars
 
-- **A table of 10 000 rows scrolls at 60 fps.** Every list is one `uniform_list`, and every cell is a string formatted when the object landed, never during a scroll.
+- **A table of 10 000 rows scrolls at 60 fps.** Every table is one `uniform_list`, and every cell is a string formatted when the object landed, never during a scroll.
 - **A watch reconnect is invisible.** A dropped connection must not blank a table or renumber it.
 - **No request blocks the window.** Everything through the trait runs on the background executor; a cluster that has gone away shows the last answer and an error line, never a frozen frame.
 - **a11y is a rule, not a polish pass.** Every control reachable by mouse is reachable by keyboard with visible focus; health is an icon *and* a colour, never a colour alone.
