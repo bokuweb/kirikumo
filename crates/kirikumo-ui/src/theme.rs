@@ -92,7 +92,7 @@ pub struct Colors {
     /// Popovers and menus.
     #[serde(rename = "bg.raised", deserialize_with = "hex")]
     pub bg_raised: Hsla,
-    /// A terminal pane; here, the log view's ground.
+    /// A terminal pane.
     #[serde(rename = "bg.terminal", deserialize_with = "hex")]
     pub bg_terminal: Hsla,
     /// Panel separators.
@@ -125,7 +125,7 @@ pub struct Colors {
     /// Broken.
     #[serde(rename = "status.error", deserialize_with = "hex")]
     pub status_error: Hsla,
-    /// Inline code, and a YAML view's ground.
+    /// Inline code, YAML, logs and collected command output.
     #[serde(rename = "code.bg", deserialize_with = "hex")]
     pub code_bg: Hsla,
 }

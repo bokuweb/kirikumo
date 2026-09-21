@@ -10,10 +10,13 @@
 //! The stream is read on a thread of its own, blocking, because there is no
 //! reactor in this process to read it on (`AGENTS.md` rule 3).
 
+use crate::Cluster;
 use crate::error::Error;
-use crate::model::{Object, ObjectList};
+use crate::model::{ApiResource, Object, ObjectList};
 use serde_json::Value;
 use std::io::BufRead;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// One line of a watch.
@@ -221,10 +224,11 @@ fn position(list: &ObjectList, object: &Object) -> Option<usize> {
 
 /// How long to wait before trying a dropped watch again.
 ///
-/// Doubling from a second to half a minute. The first retry is quick because
-/// most drops are the apiserver's own idle timeout and reconnect instantly;
-/// the ceiling is there so a cluster that has gone away is not hammered by a
-/// window someone left open.
+/// Doubling from a second to half a minute. A connection that survives long
+/// enough to be an apiserver's normal watch timeout resets it and reconnects
+/// immediately; a connection that repeatedly accepts and drops retains it.
+/// The distinction prevents a broken proxy from becoming a tight reconnect
+/// loop without making the normal timeout visible to the reader.
 #[derive(Debug, Clone, Copy)]
 pub struct Backoff {
     current: Duration,
@@ -235,6 +239,12 @@ impl Backoff {
     pub const FIRST: Duration = Duration::from_secs(1);
     /// The longest delay.
     pub const CEILING: Duration = Duration::from_secs(30);
+    /// How long a connection must live before its end is considered routine.
+    ///
+    /// The REST watch asks for five minutes. Ten seconds is deliberately far
+    /// below that, while still distinguishing a healthy stream from a proxy
+    /// that accepts a socket and drops it immediately.
+    pub const STABLE_CONNECTION: Duration = Duration::from_secs(10);
 
     /// A backoff that has not waited yet.
     pub fn new() -> Self {
@@ -250,9 +260,23 @@ impl Backoff {
         delay
     }
 
-    /// A watch connected: forget how long we had got to.
+    /// A watch proved stable: forget how long we had got to.
     pub fn reset(&mut self) {
         self.current = Self::FIRST;
+    }
+
+    /// Delay after a connected stream ends.
+    ///
+    /// A stable watch normally ended because of the apiserver's requested
+    /// timeout, so it reconnects immediately. Short-lived connections retain
+    /// the exponential backoff accumulated across repeated drops.
+    pub fn after_disconnect(&mut self, lived: Duration) -> Duration {
+        if lived >= Self::STABLE_CONNECTION {
+            self.reset();
+            Duration::ZERO
+        } else {
+            self.next_delay()
+        }
     }
 }
 
@@ -260,6 +284,100 @@ impl Default for Backoff {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Follow one resource until stopped, reconnecting transient failures.
+///
+/// `emit` runs on the caller's watch thread and returns whether its receiver
+/// still exists. Retryable connection and read failures stay inside this
+/// function: the last good list remains valid while it reconnects. A `410`
+/// or a permanent error is emitted so the store can re-list or stop.
+pub fn pump(
+    cluster: Arc<dyn Cluster>,
+    resource: ApiResource,
+    namespace: Option<String>,
+    version: String,
+    stop: Arc<AtomicBool>,
+    emit: impl FnMut(WatchEvent) -> bool,
+) {
+    let connect = |from: &str| cluster.watch(&resource, namespace.as_deref(), from);
+    pump_with_wait(connect, version, &stop, emit, wait_for_retry);
+}
+
+fn pump_with_wait<C, E, W>(
+    mut connect: C,
+    mut version: String,
+    stop: &AtomicBool,
+    mut emit: E,
+    mut wait: W,
+) where
+    C: FnMut(&str) -> crate::Result<Box<dyn WatchStream>>,
+    E: FnMut(WatchEvent) -> bool,
+    W: FnMut(&AtomicBool, Duration) -> bool,
+{
+    const RECOVERY_FORBIDDEN_ATTEMPTS: u8 = 3;
+    let mut backoff = Backoff::new();
+    let mut recovering = false;
+    let mut recovery_forbidden_attempts = 0;
+    while !stop.load(Ordering::Relaxed) {
+        let delay = match connect(&version) {
+            Ok(mut stream) => {
+                let connected_at = std::time::Instant::now();
+                while let Some(event) = stream.next_event() {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let WatchEvent::Failed(error) = &event
+                        && error.is_retryable()
+                    {
+                        recovering = true;
+                        tracing::warn!(%error, "the watch connection dropped; retrying");
+                        break;
+                    }
+                    if let Some(seen) = event.resource_version() {
+                        version = seen.to_string();
+                    }
+                    recovering = false;
+                    recovery_forbidden_attempts = 0;
+                    let terminal = matches!(event, WatchEvent::Failed(_));
+                    if !emit(event) || terminal {
+                        return;
+                    }
+                }
+                backoff.after_disconnect(connected_at.elapsed())
+            }
+            Err(error) => {
+                let startup_forbidden = recovering
+                    && matches!(error, Error::Forbidden(_))
+                    && recovery_forbidden_attempts < RECOVERY_FORBIDDEN_ATTEMPTS;
+                if !error.is_retryable() && !startup_forbidden {
+                    let _ = emit(WatchEvent::Failed(error));
+                    return;
+                }
+                recovering = true;
+                if startup_forbidden {
+                    recovery_forbidden_attempts += 1;
+                }
+                tracing::warn!(%error, "could not connect the watch; retrying");
+                backoff.next_delay()
+            }
+        };
+        if !wait(stop, delay) {
+            return;
+        }
+    }
+}
+
+fn wait_for_retry(stop: &AtomicBool, delay: Duration) -> bool {
+    let deadline = std::time::Instant::now() + delay;
+    while !stop.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    false
 }
 
 #[cfg(test)]
@@ -502,5 +620,158 @@ mod tests {
         assert_eq!(backoff.next_delay(), Backoff::CEILING);
         backoff.reset();
         assert_eq!(backoff.next_delay(), Backoff::FIRST);
+    }
+
+    #[test]
+    fn a_short_lived_connection_keeps_the_accumulated_backoff() {
+        let mut backoff = Backoff::new();
+        assert_eq!(
+            backoff.after_disconnect(Duration::from_millis(200)),
+            Backoff::FIRST
+        );
+        assert_eq!(
+            backoff.after_disconnect(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn a_stable_connection_reconnects_immediately_and_resets_the_backoff() {
+        let mut backoff = Backoff::new();
+        assert_eq!(backoff.next_delay(), Backoff::FIRST);
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+        assert_eq!(
+            backoff.after_disconnect(Backoff::STABLE_CONNECTION),
+            Duration::ZERO
+        );
+        assert_eq!(backoff.next_delay(), Backoff::FIRST);
+    }
+
+    #[test]
+    fn a_retryable_connect_failure_is_not_emitted_and_the_watch_reconnects() {
+        let stop = AtomicBool::new(false);
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let mut emitted = Vec::new();
+        pump_with_wait(
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(Error::Transport("proxy reset".into()))
+                } else {
+                    let body = format!("{}\n", frame("ADDED", "recovered", "9"));
+                    Ok(Box::new(JsonLines::new(Cursor::new(body))))
+                }
+            },
+            "1".into(),
+            &stop,
+            |event| {
+                emitted.push(event);
+                false
+            },
+            |_, delay| {
+                waits.push(delay);
+                true
+            },
+        );
+
+        assert_eq!(attempts, 2);
+        assert_eq!(waits, vec![Backoff::FIRST]);
+        assert!(
+            matches!(emitted.as_slice(), [WatchEvent::Added(object)] if object.meta.name == "recovered")
+        );
+    }
+
+    #[test]
+    fn a_forbidden_during_transport_recovery_is_retried_but_an_initial_one_is_not() {
+        let stop = AtomicBool::new(false);
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let mut emitted = Vec::new();
+        pump_with_wait(
+            |_| {
+                attempts += 1;
+                match attempts {
+                    1 => Err(Error::Transport("apiserver restarting".into())),
+                    2 => Err(Error::Forbidden("authorization not ready".into())),
+                    _ => {
+                        let body = format!("{}\n", frame("ADDED", "recovered", "9"));
+                        Ok(Box::new(JsonLines::new(Cursor::new(body))))
+                    }
+                }
+            },
+            "1".into(),
+            &stop,
+            |event| {
+                emitted.push(event);
+                false
+            },
+            |_, delay| {
+                waits.push(delay);
+                true
+            },
+        );
+        assert_eq!(attempts, 3);
+        assert_eq!(waits, vec![Duration::from_secs(1), Duration::from_secs(2)]);
+        assert!(matches!(emitted.as_slice(), [WatchEvent::Added(_)]));
+
+        let mut emitted = Vec::new();
+        pump_with_wait(
+            |_| Err(Error::Forbidden("actually forbidden".into())),
+            "1".into(),
+            &stop,
+            |event| {
+                emitted.push(event);
+                true
+            },
+            |_, _| panic!("an initial forbidden response must not retry"),
+        );
+        assert!(matches!(
+            emitted.as_slice(),
+            [WatchEvent::Failed(Error::Forbidden(_))]
+        ));
+    }
+
+    #[test]
+    fn recovery_forbidden_retries_are_bounded() {
+        let stop = AtomicBool::new(false);
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let mut emitted = Vec::new();
+        pump_with_wait(
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(Error::Transport("apiserver restarting".into()))
+                } else {
+                    Err(Error::Forbidden("authorization not ready".into()))
+                }
+            },
+            "1".into(),
+            &stop,
+            |event| {
+                emitted.push(event);
+                true
+            },
+            |_, delay| {
+                waits.push(delay);
+                true
+            },
+        );
+
+        assert_eq!(attempts, 5);
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+            ]
+        );
+        assert!(matches!(
+            emitted.as_slice(),
+            [WatchEvent::Failed(Error::Forbidden(_))]
+        ));
     }
 }
